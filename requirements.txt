@@ -1,0 +1,18 @@
+# ===== CORE DEPENDENCIES =====
+streamlit==1.37.1
+# ===== SCHEDULING & TIMEZONE =====
+APScheduler==3.10.4
+pytz==2024.1
+python-dateutil==2.9.0.post0
+# ===== HTTP & API =====
+requests==2.32.3
+# ===== SMS (TWILIO) =====
+twilio==8.12.0
+# ===== DATA VISUALIZATION =====
+plotly==5.22.0
+pandas==2.2.3
+# ===== FIREBASE / FIRESTORE =====
+google-cloud-firestore==2.19.0
+firebase-admin==6.5.0
+# ===== EXCEL EXPORT =====
+openpyxl==3.1.5
