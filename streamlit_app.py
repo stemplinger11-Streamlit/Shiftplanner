@@ -1,0 +1,3363 @@
+"""
+Wasserwacht Dienstplan+ V8.1 - Production Ready
+Alle Features | E-Mail/SMS Fix | User-Registrierung | Vollständig
+"""
+import streamlit as st
+import hashlib
+import io
+import json
+import zipfile
+import calendar as cal_module
+from datetime import datetime, timedelta, date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import email.utils
+import smtplib
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from twilio.rest import Client
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from google.cloud import firestore
+from google.oauth2 import service_account
+from collections import Counter
+
+# ===== PAGE CONFIG =====
+st.set_page_config(
+    page_title="Wasserwacht Dienstplan+",
+    page_icon="🌊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ===== KONFIGURATION =====
+VERSION = "8.1 - Production Ready"
+TIMEZONE_STR = "Europe/Berlin"
+TZ = pytz.timezone(TIMEZONE_STR)
+
+WEEKLY_SLOTS = [
+    {"id": 1, "day": "tuesday", "day_name": "Dienstag", "start": "17:00", "end": "20:00"},
+    {"id": 2, "day": "friday", "day_name": "Freitag", "start": "17:00", "end": "20:00"},
+    {"id": 3, "day": "saturday", "day_name": "Samstag", "start": "14:00", "end": "17:00"},
+]
+
+BAVARIA_HOLIDAYS = {
+    "2025": ["2025-01-01", "2025-01-06", "2025-04-18", "2025-04-21", "2025-05-01", 
+             "2025-05-29", "2025-06-09", "2025-06-19", "2025-08-15", "2025-10-03", 
+             "2025-11-01", "2025-12-25", "2025-12-26"],
+    "2026": ["2026-01-01", "2026-01-06", "2026-04-03", "2026-04-06", "2026-05-01", 
+             "2026-05-14", "2026-05-25", "2026-06-04", "2026-08-15", "2026-10-03", 
+             "2026-11-01", "2026-12-25", "2026-12-26"]
+}
+
+COLORS = {
+    "rot": "#DC143C",
+    "rot_dunkel": "#B22222",
+    "rot_hell": "#FF6B6B",
+    "blau": "#003087",
+    "blau_hell": "#4A90E2",
+    "weiss": "#FFFFFF",
+    "grau_hell": "#F5F7FA",
+    "grau_mittel": "#E1E8ED",
+    "grau_dunkel": "#657786",
+    "text": "#14171A",
+    "erfolg": "#17BF63",
+    "warnung": "#FFAD1F",
+    "fehler": "#E0245E",
+    "orange": "#FF8C00",
+    "orange_hell": "#FFA500"
+}
+
+# ===== FIREBASE INIT =====
+@st.cache_resource
+def init_firestore():
+    try:
+        if not hasattr(st, 'secrets') or 'firebase' not in st.secrets:
+            st.error("❌ Firebase Secrets fehlen!")
+            st.stop()
+        
+        firebase_config = dict(st.secrets['firebase'])
+        creds = service_account.Credentials.from_service_account_info(firebase_config)
+        return firestore.Client(credentials=creds, project=firebase_config['project_id'])
+    except Exception as e:
+        st.error(f"❌ Firebase Init Fehler: {e}")
+        st.stop()
+
+db = init_firestore()
+
+# ===== HELPER FUNCTIONS =====
+def hash_pw(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def week_start(d=None):
+    d = d or datetime.now().date()
+    if hasattr(d, "date"):
+        d = d.date()
+    return d - timedelta(days=d.weekday())
+
+def slot_date(ws, day):
+    days = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+    return (ws + timedelta(days=days.get(day,0))).strftime("%Y-%m-%d")
+
+def fmt_de(d):
+    try:
+        if isinstance(d, str):
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+        return d.strftime("%d.%m.%Y")
+    except:
+        return str(d)
+
+def is_holiday(d):
+    if isinstance(d, date):
+        d = d.strftime("%Y-%m-%d")
+    return d in BAVARIA_HOLIDAYS.get(d[:4], [])
+
+def is_summer(d):
+    try:
+        if isinstance(d, str):
+            d = datetime.strptime(d, "%Y-%m-%d")
+        return 6 <= d.month <= 9
+    except:
+        return False
+
+def is_blocked(d):
+    return is_holiday(d) or is_summer(d)
+
+def block_reason(d):
+    if is_holiday(d):
+        return "Feiertag"
+    elif is_summer(d):
+        return "Sommerpause"
+    return None
+
+def generate_random_password(length=8):
+    """Generiert ein sicheres, zufälliges Passwort (nur Buchstaben + Zahlen)"""
+    import random
+    import string
+    # Nur Buchstaben (Groß+Klein) und Zahlen - KEINE Sonderzeichen
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+# ===== CSS INJECTION (PROFESSIONELLES DESIGN) =====
+def inject_css(dark=False):
+    """
+    Modernes, mobile-optimiertes Design mit perfekter Lesbarkeit
+    Inspiriert von Material Design 3 & Apple HIG
+    Alle Fixes: Sidebar-Toggle, Dropdowns, Inputs, Slot-Cards
+    """
+    if dark:
+        # ===== DARK MODE - Dunkles Blau, nicht zu dunkel =====
+        bg_primary = "#1A1F35"      # Dunkles Blau (statt #121212)
+        bg_secondary = "#242B42"    # Heller für Cards
+        bg_surface = "#2D3548"      # Noch heller für erhobene Elemente
+        bg_elevated = "#363D52"     # Input-Hintergrund
+        
+        text_primary = "#FFFFFF"
+        text_secondary = "#B8C5D6"
+        text_muted = "#8897AA"
+        
+        accent_blue = "#5EB0EF"     # Helles Blau für gute Sichtbarkeit
+        accent_red = "#FF6B6B"      # Helleres Rot
+        accent_green = "#51CF66"    # Helleres Grün
+        accent_orange = "#FFB84D"   # Helleres Orange
+        
+        border_color = "#3D4563"
+        divider_color = "#4A5568"
+        
+        # Slot-Cards - MEHR KONTRAST
+        slot_free_bg = "#2A4A6F"        # Helleres Blau
+        slot_free_border = "#5EB0EF"    
+        slot_booked_bg = "#4A3520"      # Helleres Braun
+        slot_booked_border = "#FFB84D"  
+        slot_blocked_bg = "#3A3A3A"     # Helleres Grau
+        slot_blocked_border = "#666666" 
+        
+        # Shadows für Tiefe
+        input_shadow = "0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.05)"
+        card_shadow = "0 4px 12px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.2)"
+        card_shadow_hover = "0 8px 16px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.3)"
+        
+    else:
+        # ===== LIGHT MODE - Klar und hell =====
+        bg_primary = "#FAFAFA"
+        bg_secondary = "#FFFFFF"
+        bg_surface = "#F5F5F5"
+        bg_elevated = "#FFFFFF"
+        
+        text_primary = "#1A1A1A"
+        text_secondary = "#666666"
+        text_muted = "#999999"
+        
+        accent_blue = "#1976D2"
+        accent_red = "#C62828"
+        accent_green = "#2E7D32"
+        accent_orange = "#ED6C02"
+        
+        border_color = "#E0E0E0"
+        divider_color = "#BDBDBD"
+        
+        # Slot-Cards
+        slot_free_bg = "#E3F2FD"
+        slot_free_border = "#1976D2"
+        slot_booked_bg = "#FFF3E0"
+        slot_booked_border = "#ED6C02"
+        slot_blocked_bg = "#F5F5F5"
+        slot_blocked_border = "#9E9E9E"
+        
+        # Shadows
+        input_shadow = "0 1px 3px rgba(0, 0, 0, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.05)"
+        card_shadow = "0 2px 4px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06)"
+        card_shadow_hover = "0 4px 8px rgba(0, 0, 0, 0.15), 0 2px 4px rgba(0, 0, 0, 0.1)"
+
+    st.markdown(f"""
+    <style>
+    /* ===== GLOBAL & RESPONSIVE ===== */
+    .main {{
+        background-color: {bg_primary} !important;
+        color: {text_primary} !important;
+    }}
+    
+    /* Mobile-optimiert: Kleinere Paddings */
+    @media (max-width: 768px) {{
+        .element-container {{
+            margin-bottom: 0.5rem !important;
+        }}
+        .slot-card {{
+            padding: 0.75rem !important;
+            margin: 0.5rem 0 !important;
+        }}
+    }}
+    
+    /* ===== SIDEBAR ===== */
+    section[data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, {bg_secondary} 0%, {bg_surface} 100%) !important;
+        border-right: 1px solid {border_color} !important;
+    }}
+    
+    section[data-testid="stSidebar"] * {{
+        color: {text_primary} !important;
+    }}
+    
+    section[data-testid="stSidebar"] .stButton button {{
+        background-color: {bg_elevated} !important;
+        color: {text_primary} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 10px !important;
+        padding: 0.6rem 1rem !important;
+        font-weight: 500 !important;
+        transition: all 0.2s ease !important;
+        box-shadow: {card_shadow} !important;
+    }}
+    
+    section[data-testid="stSidebar"] .stButton button:hover {{
+        background-color: {accent_blue} !important;
+        border-color: {accent_blue} !important;
+        transform: translateX(3px) !important;
+        color: #FFFFFF !important;
+    }}
+    
+    /* ===== SIDEBAR TOGGLE BUTTON FIX ===== */
+    button[kind="header"] {{
+        background-color: {accent_blue} !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 8px !important;
+        padding: 0.5rem !important;
+    }}
+    
+    button[kind="header"]:hover {{
+        background-color: {accent_blue}DD !important;
+        transform: scale(1.05) !important;
+    }}
+    
+    /* Streamlit Sidebar Toggle (alternative Selector) */
+    [data-testid="collapsedControl"] {{
+        background-color: {accent_blue} !important;
+        color: white !important;
+        border-radius: 8px !important;
+    }}
+    
+    [data-testid="collapsedControl"] svg {{
+        color: white !important;
+        fill: white !important;
+    }}
+    
+    /* ===== BUTTONS - KLARE SICHTBARKEIT ===== */
+    .stButton button {{
+        background: linear-gradient(135deg, {accent_blue} 0%, {accent_blue}DD 100%) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 10px !important;
+        padding: 0.65rem 1.5rem !important;
+        font-weight: 600 !important;
+        font-size: 0.95rem !important;
+        transition: all 0.2s ease !important;
+        box-shadow: {card_shadow} !important;
+    }}
+    
+    .stButton button:hover {{
+        transform: translateY(-2px) !important;
+        box-shadow: {card_shadow_hover} !important;
+        opacity: 0.95 !important;
+    }}
+    
+    /* Primary Button */
+    button[kind="primary"] {{
+        background: linear-gradient(135deg, {accent_red} 0%, {accent_red}DD 100%) !important;
+    }}
+    
+    /* ===== FORMS & INPUTS - WIE IM ORIGINAL ===== */
+    .stTextInput div div input,
+    .stTextArea div div textarea,
+    .stSelectbox div div select,
+    .stNumberInput div div input {{
+        background-color: {bg_elevated} !important;
+        color: {text_primary} !important;
+        border: 2px solid {border_color} !important;
+        border-radius: 10px !important;
+        padding: 0.75rem !important;
+        font-size: 1rem !important;
+        transition: all 0.2s ease !important;
+        box-shadow: {input_shadow} !important;
+    }}
+    
+    .stTextInput div div input:focus,
+    .stTextArea div div textarea:focus,
+    .stSelectbox div div select:focus,
+    .stNumberInput div div input:focus {{
+        border-color: {accent_blue} !important;
+        box-shadow: 0 0 0 3px {accent_blue}40, {input_shadow} !important;
+        outline: none !important;
+    }}
+    
+    /* Placeholder Text */
+    .stTextInput div div input::placeholder {{
+        color: {text_muted} !important;
+        opacity: 0.6 !important;
+    }}
+    
+    /* ===== SELECTBOX / DROPDOWN FIX ===== */
+    /* Dropdown-Container */
+    [data-baseweb="select"] {{
+        background-color: {bg_elevated} !important;
+        border: 2px solid {border_color} !important;
+        border-radius: 10px !important;
+        box-shadow: {input_shadow} !important;
+    }}
+    
+    /* Dropdown-Text */
+    [data-baseweb="select"] div {{
+        color: {text_primary} !important;
+    }}
+    
+    /* Dropdown-Arrow-Icon */
+    [data-baseweb="select"] svg {{
+        color: {text_primary} !important;
+        fill: {text_primary} !important;
+    }}
+    
+    /* Dropdown-Menu (aufgeklappt) */
+    [data-baseweb="popover"] {{
+        background-color: {bg_elevated} !important;
+        border: 2px solid {border_color} !important;
+        border-radius: 10px !important;
+        box-shadow: {card_shadow_hover} !important;
+    }}
+    
+    /* Dropdown-Optionen */
+    [role="option"] {{
+        color: {text_primary} !important;
+        background-color: {bg_elevated} !important;
+    }}
+    
+    [role="option"]:hover {{
+        background-color: {accent_blue}20 !important;
+    }}
+    
+    /* Selected Option */
+    [role="option"][aria-selected="true"] {{
+        background-color: {accent_blue}30 !important;
+        color: {accent_blue} !important;
+        font-weight: 600 !important;
+    }}
+    
+    /* Selectbox Label */
+    .stSelectbox label {{
+        color: {text_primary} !important;
+        font-weight: 500 !important;
+    }}
+    
+    /* ===== TABS ===== */
+    .stTabs [data-baseweb="tab-list"] {{
+        background-color: {bg_surface} !important;
+        border-radius: 10px !important;
+        padding: 0.3rem !important;
+        gap: 0.3rem !important;
+    }}
+    
+    .stTabs [data-baseweb="tab"] {{
+        color: {text_secondary} !important;
+        border-radius: 8px !important;
+        padding: 0.6rem 1.2rem !important;
+        font-weight: 500 !important;
+    }}
+    
+    .stTabs [aria-selected="true"] {{
+        background-color: {accent_blue} !important;
+        color: white !important;
+        font-weight: 600 !important;
+        box-shadow: {card_shadow} !important;
+    }}
+    
+    /* ===== METRICS ===== */
+    [data-testid="stMetricValue"] {{
+        color: {accent_blue} !important;
+        font-size: 2rem !important;
+        font-weight: 700 !important;
+    }}
+    
+    [data-testid="stMetricLabel"] {{
+        color: {text_secondary} !important;
+        font-weight: 500 !important;
+    }}
+    
+    /* ===== ALERTS ===== */
+    .stAlert {{
+        border-radius: 10px !important;
+        border-left: 4px solid !important;
+        box-shadow: {card_shadow} !important;
+    }}
+    
+    div[data-baseweb="notification"][kind="info"] {{
+        background-color: {accent_blue}15 !important;
+        border-left-color: {accent_blue} !important;
+    }}
+    
+    div[data-baseweb="notification"][kind="success"] {{
+        background-color: {accent_green}15 !important;
+        border-left-color: {accent_green} !important;
+    }}
+    
+    div[data-baseweb="notification"][kind="warning"] {{
+        background-color: {accent_orange}15 !important;
+        border-left-color: {accent_orange} !important;
+    }}
+    
+    div[data-baseweb="notification"][kind="error"] {{
+        background-color: {accent_red}15 !important;
+        border-left-color: {accent_red} !important;
+    }}
+    
+    /* ===== SLOT CARDS - MOBILE-OPTIMIERT MIT MEHR KONTRAST ===== */
+    .slot-card {{
+        background-color: {bg_secondary} !important;
+        border: 2px solid {border_color} !important;
+        border-radius: 12px !important;
+        padding: 1rem !important;
+        margin: 0.6rem 0 !important;
+        transition: all 0.25s ease !important;
+        box-shadow: {card_shadow} !important;
+    }}
+    
+    .slot-card:hover {{
+        transform: translateY(-2px) !important;
+        box-shadow: {card_shadow_hover} !important;
+    }}
+    
+    .slot-card.free {{
+        background-color: {slot_free_bg} !important;
+        border-color: {slot_free_border} !important;
+        border-left: 5px solid {slot_free_border} !important;
+    }}
+    
+    .slot-card.booked {{
+        background-color: {slot_booked_bg} !important;
+        border-color: {slot_booked_border} !important;
+        border-left: 5px solid {slot_booked_border} !important;
+    }}
+    
+    .slot-card.blocked {{
+        background-color: {slot_blocked_bg} !important;
+        border-color: {slot_blocked_border} !important;
+        border-left: 5px solid {slot_blocked_border} !important;
+        opacity: 0.7 !important;
+    }}
+    
+    /* Status Badge - Inline im Card */
+    .status-badge {{
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.4rem 0.9rem;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.9rem;
+        margin-top: 0.6rem;
+    }}
+    
+    .status-badge.free {{
+        background-color: {accent_blue}25;
+        color: {accent_blue};
+        border: 1.5px solid {accent_blue};
+    }}
+    
+    .status-badge.booked {{
+        background-color: {accent_orange}25;
+        color: {accent_orange};
+        border: 1.5px solid {accent_orange};
+    }}
+    
+    .status-badge.blocked {{
+        background-color: {text_muted}25;
+        color: {text_muted};
+        border: 1.5px solid {text_muted};
+    }}
+    
+    /* ===== TYPOGRAPHY ===== */
+    h1, h2, h3, h4, h5, h6 {{
+        color: {text_primary} !important;
+        font-weight: 700 !important;
+    }}
+    
+    h1 {{
+        border-bottom: 3px solid {accent_blue} !important;
+        padding-bottom: 0.5rem !important;
+        margin-bottom: 1.5rem !important;
+    }}
+    
+    p, span, div {{
+        color: {text_primary} !important;
+    }}
+    
+    /* ===== DIVIDER ===== */
+    hr {{
+        border-color: {divider_color} !important;
+        margin: 1.2rem 0 !important;
+        opacity: 0.6 !important;
+    }}
+    
+    /* ===== CHECKBOX & RADIO ===== */
+    .stCheckbox label, .stRadio label {{
+        color: {text_primary} !important;
+        font-weight: 500 !important;
+    }}
+    
+    /* ===== CODE ===== */
+    code {{
+        color: {accent_blue} !important;
+        background-color: {bg_surface} !important;
+        padding: 0.2rem 0.5rem !important;
+        border-radius: 5px !important;
+        font-size: 0.9rem !important;
+    }}
+    
+    /* ===== FORMS ===== */
+    [data-testid="stForm"] {{
+        background-color: {bg_secondary} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 12px !important;
+        padding: 1.25rem !important;
+        box-shadow: {card_shadow} !important;
+    }}
+    
+    /* ===== EXPANDER ===== */
+    .streamlit-expanderHeader {{
+        background-color: {bg_elevated} !important;
+        color: {text_primary} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        padding: 0.8rem 1rem !important;
+        box-shadow: {card_shadow} !important;
+        transition: all 0.2s ease !important;
+    }}
+    
+    .streamlit-expanderHeader:hover {{
+        box-shadow: {card_shadow_hover} !important;
+    }}
+    
+    .streamlit-expanderContent {{
+        background-color: {bg_secondary} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 0 0 10px 10px !important;
+        border-top: none !important;
+        padding: 1rem !important;
+    }}
+    
+    /* ===== DATAFRAMES ===== */
+    .dataframe {{
+        border: 1px solid {border_color} !important;
+        border-radius: 10px !important;
+    }}
+    
+    /* ===== SCROLLBAR ===== */
+    ::-webkit-scrollbar {{
+        width: 8px;
+        height: 8px;
+    }}
+    
+    ::-webkit-scrollbar-track {{
+        background: {bg_surface};
+        border-radius: 4px;
+    }}
+    
+    ::-webkit-scrollbar-thumb {{
+        background: {border_color};
+        border-radius: 4px;
+    }}
+    
+    ::-webkit-scrollbar-thumb:hover {{
+        background: {accent_blue};
+    }}
+    
+    /* ===== MOBILE OPTIMIERUNGEN ===== */
+    @media (max-width: 768px) {{
+        .stButton button {{
+            padding: 0.5rem 1rem !important;
+            font-size: 0.9rem !important;
+        }}
+        
+        h1 {{
+            font-size: 1.75rem !important;
+        }}
+        
+        h3 {{
+            font-size: 1.1rem !important;
+        }}
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+# ===== DATABASE CLASS =====
+class WasserwachtDB:
+    def __init__(self):
+        self.db = db
+        self._init_admin()
+    
+    def _init_admin(self):
+        """Admin-User beim ersten Start erstellen"""
+        if hasattr(st,'secrets'):
+            email = st.secrets.get("ADMIN_EMAIL","admin@wasserwacht.de")
+            pw = st.secrets.get("ADMIN_PASSWORD","admin123")
+            
+            if not self.get_user(email):
+                try:
+                    self.db.collection('users').add({
+                        'email':email,'name':'Admin','phone':'',
+                        'password_hash':hash_pw(pw),
+                        'role':'admin','active':True,
+                        'email_notifications':True,
+                        'sms_notifications':False,
+                        'sms_booking_confirmation':True,
+                        'created_at':firestore.SERVER_TIMESTAMP
+                    })
+                    print(f"✅ Admin erstellt: {email}")
+                except Exception as e:
+                    print(f"Admin-Erstellung fehlgeschlagen: {e}")
+    
+    def get_user(self,email):
+        try:
+            for doc in self.db.collection('users').where('email','==',email).limit(1).stream():
+                data = doc.to_dict()
+                data['id'] = doc.id
+                return data
+            return None
+        except Exception as e:
+            print(f"❌ get_user Fehler: {e}")
+            return None
+    
+    def create_user(self,email,name,phone,password,role='user'):
+        try:
+            if self.get_user(email):
+                return False,"E-Mail bereits registriert"
+            
+            self.db.collection('users').add({
+                'email':email,'name':name,'phone':phone,
+                'password_hash':hash_pw(password),
+                'role':role,'active':True,
+                'email_notifications':True,
+                'sms_notifications':False,
+                'sms_booking_confirmation':True,
+                'created_at':firestore.SERVER_TIMESTAMP
+            })
+            print(f"✅ User erstellt: {email}")
+            return True,"Registrierung erfolgreich"
+        except Exception as e:
+            print(f"❌ create_user Fehler: {e}")
+            return False,str(e)
+    
+    def auth(self,email,password):
+        u = self.get_user(email)
+        if not u or not u.get('active',True):
+            return False,None
+        if u['password_hash'] == hash_pw(password):
+            return True,u
+        return False,None
+    
+    def get_all_users(self):
+        try:
+            users = []
+            for doc in self.db.collection('users').stream():
+                data = doc.to_dict()
+                data['id'] = doc.id
+                users.append(data)
+            return users
+        except Exception as e:
+            print(f"❌ get_all_users Fehler: {e}")
+            return []
+    
+    def update_user(self,uid,**kwargs):
+        try:
+            self.db.collection('users').document(uid).update(kwargs)
+            print(f"✅ User geupdatet: {uid}")
+            return True
+        except Exception as e:
+            print(f"❌ update_user Fehler: {e}")
+            return False
+    
+    def delete_user(self,uid):
+        try:
+            self.db.collection('users').document(uid).delete()
+            print(f"✅ User gelöscht: {uid}")
+            return True
+        except Exception as e:
+            print(f"❌ delete_user Fehler: {e}")
+            return False
+            
+    def trigger_password_reset(self, uid):
+        """
+        Triggert Password Reset für einen User:
+        - Generiert neues temporäres Passwort (8 Zeichen, nur Buchstaben+Zahlen)
+        - Setzt neues password_hash
+        - Returned (success, new_password) für Email-Versand
+        """
+        try:
+            new_password = generate_random_password(8)
+            self.db.collection('users').document(uid).update({
+                'password_hash': hash_pw(new_password),
+                'password_reset_at': firestore.SERVER_TIMESTAMP
+            })
+            print(f"✅ Password Reset triggered für User: {uid}")
+            return True, new_password
+        except Exception as e:
+            print(f"❌ trigger_password_reset Fehler: {e}")
+            return False, None
+
+    
+    def get_week_bookings(self, ws):
+        """Alle Buchungen für eine Woche laden"""
+        try:
+            we = (datetime.strptime(ws,'%Y-%m-%d')+timedelta(days=6)).strftime('%Y-%m-%d')
+            result = []
+            for doc in self.db.collection('bookings')\
+                    .where('slot_date','>=',ws)\
+                    .where('slot_date','<=',we)\
+                    .where('status','==','confirmed').stream():
+                data = doc.to_dict()
+                data['id'] = doc.id
+                result.append(data)
+            return result
+        except Exception as e:
+            print(f"❌ get_week_bookings Fehler: {e}")
+            # Fallback
+            try:
+                result = []
+                for doc in self.db.collection('bookings').where('status','==','confirmed').stream():
+                    b = doc.to_dict()
+                    if ws <= b.get('slot_date','') <= we:
+                        b['id'] = doc.id
+                        result.append(b)
+                return result
+            except:
+                return []
+    
+    def create_booking(self,slot_date,slot_time,user_email,user_name,user_phone):
+        try:
+            existing = self.get_booking(slot_date,slot_time)
+            if existing:
+                return False,"Slot bereits gebucht"
+            
+            self.db.collection('bookings').add({
+                'slot_date':slot_date,'slot_time':slot_time,
+                'user_email':user_email,'user_name':user_name,
+                'user_phone':user_phone,'status':'confirmed',
+                'created_at':firestore.SERVER_TIMESTAMP
+            })
+            print(f"✅ Buchung erstellt: {user_name} | {slot_date} {slot_time}")
+            return True,"Buchung erfolgreich"
+        except Exception as e:
+            print(f"❌ create_booking Fehler: {e}")
+            return False,str(e)
+    
+    def get_booking(self,slot_date,slot_time):
+        try:
+            for doc in self.db.collection('bookings')\
+                    .where('slot_date','==',slot_date)\
+                    .where('slot_time','==',slot_time)\
+                    .where('status','==','confirmed').limit(1).stream():
+                data = doc.to_dict()
+                data['id'] = doc.id
+                return data
+            return None
+        except Exception as e:
+            print(f"❌ get_booking Fehler: {e}")
+            return None
+    
+    def get_user_bookings(self,email,future_only=False):
+        try:
+            q = self.db.collection('bookings')\
+                .where('user_email','==',email)\
+                .where('status','==','confirmed')
+            
+            if future_only:
+                q = q.where('slot_date','>=',datetime.now().strftime("%Y-%m-%d"))
+            
+            bookings = []
+            for doc in q.stream():
+                data = doc.to_dict()
+                data['id'] = doc.id
+                bookings.append(data)
+            return sorted(bookings,key=lambda x:x['slot_date'])
+        except Exception as e:
+            print(f"❌ get_user_bookings Fehler: {e}")
+            return []
+    
+    def cancel_booking(self,bid,cancelled_by):
+        try:
+            self.db.collection('bookings').document(bid).update({
+                'status':'cancelled',
+                'cancelled_by':cancelled_by,
+                'cancelled_at':firestore.SERVER_TIMESTAMP
+            })
+            print(f"✅ Buchung storniert: {bid}")
+            return True
+        except Exception as e:
+            print(f"❌ cancel_booking Fehler: {e}")
+            return False
+    
+    def get_setting(self,key,default=''):
+        try:
+            doc = self.db.collection('settings').document(key).get()
+            return doc.to_dict().get('value',default) if doc.exists else default
+        except:
+            return default
+    
+    def set_setting(self,key,value):
+        try:
+            self.db.collection('settings').document(key).set({
+                'value':value,
+                'updated_at':firestore.SERVER_TIMESTAMP
+            },merge=True)
+            return True
+        except:
+            return False
+    
+    def archive_old(self):
+        """Alte Buchungen archivieren"""
+        try:
+            months = 12
+            archive_date = (datetime.now()-timedelta(days=30*months)).strftime("%Y-%m-%d")
+            count = 0
+            for doc in self.db.collection('bookings').where('slot_date','<',archive_date).stream():
+                self.db.collection('archive').add(doc.to_dict())
+                doc.reference.delete()
+                count += 1
+            if count > 0:
+                print(f"✅ {count} Buchungen archiviert")
+            return count
+        except Exception as e:
+            print(f"❌ archive_old Fehler: {e}")
+            return 0
+
+ww_db = WasserwachtDB()
+
+# ===== E-MAIL KLASSE (VOLLSTÄNDIG MIT TEMPLATE-SUPPORT) =====
+class Mailer:
+    """E-Mail Versand mit detailliertem Error-Handling und Template-System"""
+    def __init__(self):
+        if hasattr(st,'secrets'):
+            self.server = st.secrets.get("SMTP_SERVER","smtp.gmail.com")
+            self.port = int(st.secrets.get("SMTP_PORT",587))
+            self.user = st.secrets.get("SMTP_USER","")
+            self.pw = st.secrets.get("SMTP_PASSWORD","")
+            self.admin_receiver = st.secrets.get("ADMIN_EMAIL_RECEIVER","")
+            self.fromname = "Wasserwacht Dienstplan"
+        else:
+            self.server = self.port = self.user = self.pw = self.admin_receiver = ""
+            self.fromname = "Dienstplan"
+    
+    def send(self, to, subject, body, attachments=None):
+        """
+        Sendet eine E-Mail mit detailliertem Error-Handling
+        Returns: (success: bool, error_message: str)
+        """
+        if not self.user or not self.pw:
+            return False, "❌ E-Mail: Keine SMTP Credentials in secrets.toml konfiguriert"
+        
+        if not to:
+            return False, "❌ E-Mail: Keine Empfänger-Adresse angegeben"
+        
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = email.utils.formataddr((self.fromname, self.user))
+            msg['To'] = to
+            msg['Subject'] = subject
+            msg['Date'] = email.utils.formatdate(localtime=True)
+            msg.attach(MIMEText(body, 'plain'))
+            
+            if attachments:
+                for filename, data in attachments:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(data)
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f'attachment; filename={filename}')
+                    msg.attach(part)
+            
+            with smtplib.SMTP(self.server, self.port, timeout=60) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
+                
+                try:
+                    smtp.login(self.user, self.pw)
+                except smtplib.SMTPAuthenticationError as auth_err:
+                    return False, f"❌ SMTP Login fehlgeschlagen: {str(auth_err)}\n\nPrüfen Sie:\n1. Ist SMTP_USER korrekt? (aktuell: {self.user})\n2. Verwenden Sie ein Gmail App-Passwort?\n3. Ist 2-Faktor-Auth aktiviert?"
+                
+                smtp.send_message(msg)
+            
+            return True, f"✅ E-Mail erfolgreich an {to} gesendet"
+            
+        except smtplib.SMTPException as smtp_err:
+            return False, f"❌ SMTP Fehler: {type(smtp_err).__name__}: {str(smtp_err)}"
+        except Exception as e:
+            return False, f"❌ E-Mail Fehler: {type(e).__name__}: {str(e)}"
+    
+    def send_booking_confirmation(self, user_email, user_name, slot_date, slot_time):
+        """Buchungsbestätigung senden - verwendet Template"""
+        # Lade Template aus Firestore
+        subject_template = ww_db.get_setting('email_booking_subject', 'Buchungsbestätigung - {date}')
+        body_template = ww_db.get_setting('email_booking_body', 
+            """Hallo {name},
+
+deine Buchung wurde bestätigt:
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Bei Fragen melde dich gerne unter {org_email}.
+
+Viele Grüße,
+Dein {org_name} Team 🌊""")
+        
+        # Platzhalter ersetzen
+        data = {
+            'name': user_name,
+            'date': fmt_de(slot_date),
+            'time': slot_time,
+            'email': user_email,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht'),
+            'org_email': self.admin_receiver,
+            'current_date': datetime.now().strftime('%d.%m.%Y %H:%M')
+        }
+        
+        subject = subject_template
+        body = body_template
+        for key, value in data.items():
+            subject = subject.replace('{' + key + '}', str(value))
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(user_email, subject, body)
+    
+    def send_cancellation(self, user_email, user_name, slot_date, slot_time):
+        """Stornierungsbestätigung senden - verwendet Template"""
+        subject_template = ww_db.get_setting('email_cancellation_subject', 'Stornierung - {date}')
+        body_template = ww_db.get_setting('email_cancellation_body',
+            """Hallo {name},
+
+deine Buchung wurde storniert:
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Viele Grüße,
+Dein {org_name} Team 🌊""")
+        
+        data = {
+            'name': user_name,
+            'date': fmt_de(slot_date),
+            'time': slot_time,
+            'email': user_email,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht'),
+            'org_email': self.admin_receiver,
+            'current_date': datetime.now().strftime('%d.%m.%Y %H:%M')
+        }
+        
+        subject = subject_template
+        body = body_template
+        for key, value in data.items():
+            subject = subject.replace('{' + key + '}', str(value))
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(user_email, subject, body)
+    
+    def send_reminder(self, user_email, user_name, slot_date, slot_time):
+        """Erinnerung senden - verwendet Template"""
+        subject_template = ww_db.get_setting('email_reminder_subject', '⏰ Erinnerung: Dienst morgen - {date}')
+        body_template = ww_db.get_setting('email_reminder_body',
+            """Hallo {name},
+
+dein Dienst ist morgen:
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Bis morgen!
+Dein {org_name} Team 🌊""")
+        
+        data = {
+            'name': user_name,
+            'date': fmt_de(slot_date),
+            'time': slot_time,
+            'email': user_email,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht'),
+            'org_email': self.admin_receiver,
+            'current_date': datetime.now().strftime('%d.%m.%Y %H:%M')
+        }
+        
+        subject = subject_template
+        body = body_template
+        for key, value in data.items():
+            subject = subject.replace('{' + key + '}', str(value))
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(user_email, subject, body)
+    
+    def send_welcome(self, user_email, user_name):
+        """Willkommens-E-Mail senden - NEU"""
+        subject_template = ww_db.get_setting('email_welcome_subject', 'Willkommen bei {org_name}!')
+        body_template = ww_db.get_setting('email_welcome_body',
+            """Hallo {name},
+
+herzlich willkommen bei {org_name}! 🌊
+
+Dein Account wurde erfolgreich erstellt.
+Du kannst dich jetzt anmelden und Schichten buchen.
+
+📧 E-Mail: {email}
+
+Bei Fragen erreichst du uns unter {org_email}.
+
+Viele Grüße,
+Dein {org_name} Team""")
+        
+        data = {
+            'name': user_name,
+            'email': user_email,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht'),
+            'org_email': self.admin_receiver,
+            'current_date': datetime.now().strftime('%d.%m.%Y %H:%M')
+        }
+        
+        subject = subject_template
+        body = body_template
+        for key, value in data.items():
+            subject = subject.replace('{' + key + '}', str(value))
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(user_email, subject, body)
+    
+    def send_password_reset(self, user_email, user_name, new_password):
+        """Password Reset Email senden - verwendet Template aus DB"""
+        # Template aus DB laden (falls Admin es angepasst hat)
+        subject_template = ww_db.get_setting(
+            'email_password_reset_subject', 
+            '🔐 Passwort zurückgesetzt - {org_name}'
+        )
+        body_template = ww_db.get_setting(
+            'email_password_reset_body',
+            """Hallo {name},
+
+dein Passwort wurde von einem Administrator zurückgesetzt.
+
+🔑 **Dein neues temporäres Passwort:**
+{new_password}
+
+⚠️ **WICHTIG - Bitte beachten:**
+1. Verwende dieses Passwort für die nächste Anmeldung
+2. Ändere dein Passwort nach dem Login in ein persönliches, sicheres Passwort (im Profil unter "Sicherheit")
+3. Bewahre dieses Passwort sicher auf
+
+📧 Deine E-Mail: {email}
+
+Bei Fragen erreichst du uns unter {org_email}.
+
+Viele Grüße,
+Dein {org_name} Team 🌊
+
+---
+Gesendet am {current_date}"""
+        )
+        
+        # Variablen ersetzen
+        data = {
+            'name': user_name,
+            'email': user_email,
+            'new_password': new_password,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht'),
+            'org_email': self.admin_receiver,
+            'current_date': datetime.now(TZ).strftime('%d.%m.%Y %H:%M')
+        }
+        
+        subject = subject_template
+        body = body_template
+        for key, value in data.items():
+            subject = subject.replace('{' + key + '}', str(value))
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(user_email, subject, body)
+
+    def send_admin_notification(self, user_name, user_email, user_phone, slot_date, slot_time):
+        """Admin-Benachrichtigung bei neuer Buchung - NEU"""
+        if not self.admin_receiver:
+            return False, "Keine Admin-E-Mail konfiguriert"
+        
+        subject_template = ww_db.get_setting('email_admin_notification_subject', '🔔 Neue Buchung: {name} - {date}')
+        body_template = ww_db.get_setting('email_admin_notification_body',
+            """Neue Buchung im Dienstplan:
+
+👤 Name: {name}
+📧 E-Mail: {email}
+📱 Telefon: {phone}
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Gebucht am: {current_date}""")
+        
+        data = {
+            'name': user_name,
+            'email': user_email,
+            'phone': user_phone if user_phone else 'Nicht angegeben',
+            'date': fmt_de(slot_date),
+            'time': slot_time,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht'),
+            'org_email': self.admin_receiver,
+            'current_date': datetime.now().strftime('%d.%m.%Y %H:%M')
+        }
+        
+        subject = subject_template
+        body = body_template
+        for key, value in data.items():
+            subject = subject.replace('{' + key + '}', str(value))
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(self.admin_receiver, subject, body)
+
+# ===== SMS KLASSE (VOLLSTÄNDIG MIT TEMPLATE-SUPPORT) =====
+class TwilioSMS:
+    """SMS Versand mit Twilio und robuster Telefonnummer-Formatierung"""
+    def __init__(self):
+        if hasattr(st, 'secrets'):
+            self.enabled = st.secrets.get("ENABLE_SMS_REMINDER", "false").lower() == "true"
+            self.account_sid = st.secrets.get("TWILIO_ACCOUNT_SID", "")
+            self.auth_token = st.secrets.get("TWILIO_AUTH_TOKEN", "")
+            self.from_number = st.secrets.get("TWILIO_PHONE_NUMBER", "")
+            
+            if self.account_sid and self.auth_token:
+                try:
+                    self.client = Client(self.account_sid, self.auth_token)
+                except Exception as e:
+                    self.client = None
+                    self.enabled = False
+            else:
+                self.client = None
+                self.enabled = False
+        else:
+            self.enabled = False
+            self.client = None
+            self.from_number = ""
+    
+    def format_phone_number(self, phone):
+        """Formatiert Telefonnummern für Twilio (E.164 Format)"""
+        if not phone:
+            return None
+        
+        phone = ''.join(c for c in phone if c.isdigit() or c == '+')
+        
+        if phone.startswith('+'):
+            return phone
+        if phone.startswith('0'):
+            return '+49' + phone[1:]
+        if phone[0].isdigit():
+            return '+49' + phone
+        
+        return None
+    
+    def send(self, to, body):
+        """Sendet SMS über Twilio"""
+        if not self.enabled:
+            return False, "SMS ist deaktiviert"
+        
+        if not self.client:
+            return False, "❌ Twilio Client konnte nicht initialisiert werden"
+        
+        if not self.from_number:
+            return False, "❌ Keine Twilio-Telefonnummer konfiguriert"
+        
+        if not self.from_number.startswith('+'):
+            return False, f"❌ Twilio-Nummer muss mit + beginnen (aktuell: {self.from_number})"
+        
+        formatted_to = self.format_phone_number(to)
+        if not formatted_to:
+            return False, f"❌ Ungültige Telefonnummer: {to}"
+        
+        try:
+            message = self.client.messages.create(
+                to=formatted_to,
+                from_=self.from_number,
+                body=body
+            )
+            
+            if message.sid:
+                return True, f"✅ SMS erfolgreich an {formatted_to} gesendet (SID: {message.sid})"
+            else:
+                return False, "❌ SMS-Versand fehlgeschlagen"
+                
+        except Exception as e:
+            error_msg = f"❌ Twilio Fehler: {type(e).__name__}: {str(e)}"
+            if "Unable to create record" in str(e):
+                error_msg += f"\n\nMögliche Ursachen:\n1. Ziel-Nummer ist ungültig: {formatted_to}\n2. Twilio-Nummer ist nicht SMS-fähig"
+            elif "authenticate" in str(e).lower():
+                error_msg += "\n\nPrüfen Sie TWILIO_ACCOUNT_SID und TWILIO_AUTH_TOKEN"
+            return False, error_msg
+    
+    def send_booking_confirmation(self, phone, name, slot_date, slot_time):
+        """SMS-Buchungsbestätigung - verwendet Template"""
+        body_template = ww_db.get_setting('sms_booking_body',
+            """🌊 Buchung bestätigt: {name}
+📅 {date}
+⏰ {time}
+
+{org_name}""")
+        
+        data = {
+            'name': name,
+            'date': fmt_de(slot_date),
+            'time': slot_time,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht')
+        }
+        
+        body = body_template
+        for key, value in data.items():
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(phone, body)
+    
+    def send_reminder(self, phone, name, slot_date, slot_time):
+        """SMS-Erinnerung - verwendet Template"""
+        body_template = ww_db.get_setting('sms_reminder_body',
+            """⏰ Erinnerung: Dienst morgen!
+📅 {date}
+⏰ {time}
+
+{org_name}""")
+        
+        data = {
+            'name': name,
+            'date': fmt_de(slot_date),
+            'time': slot_time,
+            'org_name': ww_db.get_setting('org_name', 'Wasserwacht')
+        }
+        
+        body = body_template
+        for key, value in data.items():
+            body = body.replace('{' + key + '}', str(value))
+        
+        return self.send(phone, body)
+
+# ===== INIT =====
+mailer = Mailer()
+sms_client = TwilioSMS()
+
+# ===== SESSION STATE INIT =====
+if 'user' not in st.session_state:
+    st.session_state.user = None
+if 'page' not in st.session_state:
+    st.session_state.page = 'kalender'
+if 'dark_mode' not in st.session_state:
+    st.session_state.dark_mode = ww_db.get_setting('dark_mode','false') == 'true'
+if 'selected_week' not in st.session_state:
+    st.session_state.selected_week = week_start()
+
+# ===== LOGIN & REGISTRIERUNG =====
+def login_page():
+    st.title("🌊 Wasserwacht Dienstplan+")
+    st.markdown(f"**Version:** {VERSION}")
+    
+    tab1, tab2 = st.tabs(["🔐 Anmelden", "📝 Registrieren"])
+    
+    with tab1:
+        with st.form("login_form"):
+            email = st.text_input("E-Mail")
+            password = st.text_input("Passwort", type="password")
+            submit = st.form_submit_button("Anmelden", use_container_width=True)
+            
+            if submit:
+                if email and password:
+                    success, user = ww_db.auth(email, password)
+                    if success:
+                        st.session_state.user = user
+                        st.success(f"✅ Willkommen, {user['name']}!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Ungültige Anmeldedaten")
+                else:
+                    st.warning("⚠️ Bitte alle Felder ausfüllen")
+    
+    with tab2:
+        with st.form("register_form"):
+            st.markdown("### Neuen Account erstellen")
+            reg_name = st.text_input("Name*")
+            reg_email = st.text_input("E-Mail*")
+            reg_phone = st.text_input("Telefon (optional)", placeholder="+49 oder 0172...")
+            reg_pw = st.text_input("Passwort*", type="password")
+            reg_pw2 = st.text_input("Passwort wiederholen*", type="password")
+            
+            email_notif = st.checkbox("E-Mail Benachrichtigungen", value=True)
+            sms_notif = st.checkbox("SMS Benachrichtigungen", value=False)
+            
+            reg_submit = st.form_submit_button("Registrieren", use_container_width=True)
+            
+            if reg_submit:
+                if not reg_name or not reg_email or not reg_pw:
+                    st.error("❌ Bitte alle Pflichtfelder (*) ausfüllen")
+                elif reg_pw != reg_pw2:
+                    st.error("❌ Passwörter stimmen nicht überein")
+                elif len(reg_pw) < 6:
+                    st.error("❌ Passwort muss mindestens 6 Zeichen haben")
+                else:
+                    success, msg = ww_db.create_user(reg_email, reg_name, reg_phone, reg_pw)
+                    if success:
+                        st.success(f"✅ {msg}! Du kannst dich jetzt anmelden.")
+                        st.balloons()
+                    else:
+                        st.error(f"❌ {msg}")
+
+def logout():
+    st.session_state.user = None
+    st.session_state.page = 'kalender'
+    st.rerun()
+
+# ===== NAVIGATION =====
+def show_navigation():
+    user = st.session_state.user
+    is_admin = user.get('role') == 'admin' if user else False
+    
+    with st.sidebar:
+        st.title(f"👤 {user.get('name', 'Benutzer')}")
+        st.markdown(f"**{user.get('email')}**")
+        
+        if is_admin:
+            st.markdown("🔑 **Administrator**")
+        
+        st.divider()
+        
+        # Navigation Buttons
+        pages = [
+            ('kalender', '📅 Kalender'),
+            ('meine_buchungen', '📋 Meine Buchungen'),
+            ('profil', '👤 Profil'),
+            ('statistik', '📊 Statistik'),
+            ('handbuch', '📖 Handbuch'),
+            ('impressum', '⚖️ Impressum'),
+        ]
+        
+        if is_admin:
+            pages.extend([
+                ('verwaltung', '⚙️ Verwaltung'),
+                ('benutzer', '👥 Benutzer'),
+                ('export', '💾 Export'),
+                ('vorlagen', '📧 Vorlagen'),
+                ('debug', '🔧 Debug'),
+            ])
+        
+        for page_id, label in pages:
+            if st.button(label, key=f"nav_{page_id}", use_container_width=True):
+                st.session_state.page = page_id
+                st.rerun()
+        
+        st.divider()
+        
+        # Dark Mode Toggle
+        # ===== iOS-STYLE DARK MODE TOGGLE =====
+        st.markdown("---")
+        st.markdown("### 🎨 Design")
+    
+        # Custom iOS-Style Toggle mit CSS
+        current_mode = st.session_state.dark_mode
+    
+        toggle_html = f"""
+        <style>
+        .theme-toggle {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem 1rem;
+            background: {'#1E1E1E' if current_mode else '#FFFFFF'};
+            border: 2px solid {'#2C2C2C' if current_mode else '#E0E0E0'};
+            border-radius: 12px;
+            margin: 0.5rem 0;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, {'0.3' if current_mode else '0.1'});
+            transition: all 0.3s ease;
+        }}
+    
+        .theme-label {{
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: {'#FFFFFF' if current_mode else '#1A1A1A'};
+        }}
+    
+        .theme-icon {{
+            font-size: 1.2rem;
+        }}
+        </style>
+    
+        <div class="theme-toggle">
+            <span class="theme-icon">{'🌙' if current_mode else '☀️'}</span>
+            <span class="theme-label">{'Dark Mode' if current_mode else 'Light Mode'}</span>
+        </div>
+        """
+    
+        st.markdown(toggle_html, unsafe_allow_html=True)
+    
+        # Toggle Button
+        col1, col2 = st.columns(2)
+        with col1:
+            if not current_mode:
+                if st.button("🌙 Dark", key="switch_dark", use_container_width=True):
+                    st.session_state.dark_mode = True
+                    if is_admin:
+                        ww_db.set_setting('dark_mode', 'true')
+                    st.rerun()
+        with col2:
+            if current_mode:
+                if st.button("☀️ Light", key="switch_light", use_container_width=True):
+                    st.session_state.dark_mode = False
+                    if is_admin:
+                        ww_db.set_setting('dark_mode', 'false')
+                    st.rerun()
+
+        st.divider()
+        
+        if st.button("🚪 Abmelden", use_container_width=True):
+            logout()
+        
+        st.divider()
+        st.caption(f"Version {VERSION}")
+# ===== KALENDER SEITE (KOMPLETT ÜBERARBEITET) =====
+def kalender_page():
+    """Kalender-Seite - Original-Funktionalität mit modernem 3D-Design"""
+    user = st.session_state.user
+    
+    st.title("📅 Wochenschichten buchen")
+    st.caption("Buchen Sie Ihre Schichten für die kommenden Wochen")
+    
+    # Session State für Woche
+    if 'selected_week' not in st.session_state:
+        st.session_state.selected_week = week_start()
+    
+    # ===== WOCHENAUSWAHL =====
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
+    
+    with col1:
+        kw = st.session_state.selected_week.isocalendar()[1]
+        jahr = st.session_state.selected_week.year
+        st.markdown(f"### KW {kw}, {jahr}")
+        st.caption(f"Woche ab {fmt_de(st.session_state.selected_week)}")
+    
+    with col2:
+        if st.button("⬅️ Vorherige", use_container_width=True):
+            st.session_state.selected_week = week_start(
+                st.session_state.selected_week - timedelta(days=7)
+            )
+            st.rerun()
+    
+    with col3:
+        if st.button("Nächste ➡️", use_container_width=True):
+            st.session_state.selected_week = week_start(
+                st.session_state.selected_week + timedelta(days=7)
+            )
+            st.rerun()
+    
+    with col4:
+        if st.button("🔄 Diese Woche", use_container_width=True):
+            st.session_state.selected_week = week_start()
+            st.rerun()
+    
+    st.divider()
+    
+    # ===== BUCHUNGEN LADEN =====
+    ws_str = st.session_state.selected_week.strftime("%Y-%m-%d")
+    bookings = ww_db.get_week_bookings(ws_str)
+    
+    # ===== SLOTS MIT 3D-CARDS ANZEIGEN =====
+    for slot_config in WEEKLY_SLOTS:
+        sd = slot_date(st.session_state.selected_week, slot_config['day'])
+        
+        # Blockierung prüfen
+        blocked = is_blocked(sd)
+        reason = block_reason(sd) if blocked else None
+        
+        # Buchung suchen
+        booking = None
+        for b in bookings:
+            if b.get('slot_date') == sd and b.get('slot_time', '').startswith(slot_config['start']):
+                booking = b
+                break
+        
+        # ===== STATUS =====
+        if blocked:
+            status_class = "blocked"
+            status_text = f"🚫 Blockiert ({reason})"
+            status_icon = "🚫"
+        elif booking:
+            status_class = "booked"
+            status_text = f"✅ Gebucht von {booking.get('user_name', 'N/A')}"
+            status_icon = "✅"
+        else:
+            status_class = "free"
+            status_text = "✨ Verfügbar"
+            status_icon = "✨"
+        
+        # ===== 3D CARD =====
+        st.markdown(f"""
+        <div class="slot-card {status_class}">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem;">
+                <div style="flex: 1;">
+                    <h3 style="margin: 0; font-size: 1.15rem; font-weight: 700;">{slot_config['day_name']}</h3>
+                    <p style="margin: 0.3rem 0 0 0; font-size: 0.9rem; opacity: 0.85;">
+                        📅 {fmt_de(sd)} | 🕐 {slot_config['start']} - {slot_config['end']}
+                    </p>
+                </div>
+                <div style="font-size: 1.8rem; line-height: 1;">
+                    {status_icon}
+                </div>
+            </div>
+            <div class="status-badge {status_class}">
+                {status_text}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # ===== AKTIONEN (WIE IM ORIGINAL) =====
+        if not blocked:
+            if booking:
+                # Gebuchter Slot
+                if booking.get('user_email') == user.get('email') or user.get('role') == 'admin':
+                    col_btn1, col_btn2 = st.columns([4, 1])
+                    with col_btn2:
+                        if st.button("❌ Stornieren", key=f"cancel_{sd}_{slot_config['start']}", use_container_width=True):
+                            success = ww_db.cancel_booking(booking['id'], user.get('email'))
+                            if success:
+                                # Email senden
+                                mailer.send_cancellation(
+                                    booking.get('user_email'),
+                                    booking.get('user_name'),
+                                    sd,
+                                    f"{slot_config['start']} - {slot_config['end']}"
+                                )
+                                st.success("✅ Stornierung erfolgreich!")
+                                st.rerun()
+                            else:
+                                st.error("❌ Fehler bei der Stornierung")
+            else:
+                # Freier Slot - DIREKTER BUTTON WIE IM ORIGINAL
+                col_info, col_btn = st.columns([4, 1])
+                with col_btn:
+                    if st.button("📝 Buchen", key=f"book_{sd}_{slot_config['start']}", use_container_width=True, type="primary"):
+                        # Direkt buchen mit Session-User-Daten
+                        success, msg = ww_db.create_booking(
+                            sd,
+                            f"{slot_config['start']} - {slot_config['end']}",
+                            user.get('email'),
+                            user.get('name'),
+                            user.get('phone', '')
+                        )
+                        
+                        if success:
+                            # Benachrichtigungen senden
+                            if user.get('email_notifications', True):
+                                mailer.send_booking_confirmation(
+                                    user.get('email'),
+                                    user.get('name'),
+                                    sd,
+                                    f"{slot_config['start']} - {slot_config['end']}"
+                                )
+                            
+                            if user.get('sms_notifications', False) and user.get('phone'):
+                                sms_client.send_booking_confirmation(
+                                    user.get('phone'),
+                                    user.get('name'),
+                                    sd,
+                                    f"{slot_config['start']} - {slot_config['end']}"
+                                )
+                            
+                            # Admin-Benachrichtigung
+                            if user.get('role') != 'admin':
+                                mailer.send_admin_notification(
+                                    user.get('name'),
+                                    user.get('email'),
+                                    user.get('phone', ''),
+                                    sd,
+                                    f"{slot_config['start']} - {slot_config['end']}"
+                                )
+                            
+                            st.success(f"✅ {msg}")
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {msg}")
+        
+        st.markdown("---")
+    
+    # ===== ADMIN-ÜBERSICHT =====
+    if user.get('role') == 'admin':
+        st.divider()
+        with st.expander("🔍 Wochenübersicht (Admin)", expanded=False):
+            if bookings:
+                st.markdown(f"**📊 {len(bookings)} Buchung(en):**")
+                for b in sorted(bookings, key=lambda x: (x.get('slot_date', ''), x.get('slot_time', ''))):
+                    st.markdown(f"- **{fmt_de(b.get('slot_date'))}** | {b.get('slot_time')} | {b.get('user_name')} ({b.get('user_email')})")
+            else:
+                st.info("Noch keine Buchungen in dieser Woche")
+
+# ===== MEINE BUCHUNGEN =====
+def meine_buchungen_page():
+    user = st.session_state.user
+    
+    st.title("📋 Meine Buchungen")
+    
+    bookings = ww_db.get_user_bookings(user['email'], future_only=False)
+    
+    if not bookings:
+        st.info("Du hast noch keine Buchungen.")
+        return
+    
+    # Nach zukünftig/vergangen filtern
+    today = datetime.now().date().strftime("%Y-%m-%d")
+    future = [b for b in bookings if b['slot_date'] >= today]
+    past = [b for b in bookings if b['slot_date'] < today]
+    
+    tab1, tab2 = st.tabs([f"🔜 Zukünftig ({len(future)})", f"📅 Vergangen ({len(past)})"])
+    
+    with tab1:
+        if not future:
+            st.info("Keine zukünftigen Buchungen.")
+        else:
+            for b in future:
+                with st.expander(f"{fmt_de(b['slot_date'])} - {b.get('slot_time', 'N/A')}", expanded=True):
+                    st.markdown(f"**📅 Datum:** {fmt_de(b['slot_date'])}")
+                    st.markdown(f"**⏰ Zeit:** {b.get('slot_time', 'N/A')}")
+                    st.markdown(f"**📧 E-Mail:** {b['user_email']}")
+                    if b.get('user_phone'):
+                        st.markdown(f"**📱 Telefon:** {b['user_phone']}")
+                    
+                    if st.button("❌ Stornieren", key=f"cancel_my_{b['id']}"):
+                        if ww_db.cancel_booking(b['id'], user['email']):
+                            success, msg = mailer.send_cancellation(
+                                user['email'], user['name'], b['slot_date'], b.get('slot_time', '')
+                            )
+                            st.success("✅ Buchung storniert")
+                            st.rerun()
+    
+    with tab2:
+        if not past:
+            st.info("Keine vergangenen Buchungen.")
+        else:
+            for b in past:
+                with st.expander(f"{fmt_de(b['slot_date'])} - {b.get('slot_time', 'N/A')}"):
+                    st.markdown(f"**📅 Datum:** {fmt_de(b['slot_date'])}")
+                    st.markdown(f"**⏰ Zeit:** {b.get('slot_time', 'N/A')}")
+                    st.markdown(f"**Status:** {b.get('status', 'confirmed')}")
+
+# ===== PROFIL-SEITE (FÜR ALLE USER) =====
+def profil_page():
+    user = st.session_state.user
+    is_admin = user.get('role') == 'admin'
+    
+    # Titel mit Admin-Badge
+    if is_admin:
+        st.title("👤 Mein Profil 🔑")
+        st.info("👑 **Administrator**")
+    else:
+        st.title("👤 Mein Profil")
+    
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["📋 Profil-Info", "🔔 Benachrichtigungen", "🔒 Sicherheit"])
+    
+    # ===== TAB 1: PROFIL-INFO =====
+    with tab1:
+        st.subheader("Persönliche Informationen")
+        
+        with st.form("profil_info"):
+            # Name (editierbar)
+            name = st.text_input(
+                "Name",
+                value=user.get('name', ''),
+                help="Ihr vollständiger Name"
+            )
+            
+            # E-Mail (editierbar mit Warnung)
+            st.markdown("**E-Mail-Adresse**")
+            email = st.text_input(
+                "E-Mail",
+                value=user.get('email', ''),
+                help="Ihre E-Mail-Adresse für Login und Benachrichtigungen",
+                label_visibility="collapsed"
+            )
+            st.warning("⚠️ Wichtig: Prüfen Sie die E-Mail-Adresse sorgfältig! Sie benötigen sie für den Login.")
+            
+            # Telefon (editierbar mit Auto-Format)
+            st.markdown("**Telefonnummer**")
+            phone = st.text_input(
+                "Telefon",
+                value=user.get('phone', ''),
+                placeholder="z.B. 0172 1234567 oder +49 172 1234567",
+                help="Für SMS-Benachrichtigungen (optional)",
+                label_visibility="collapsed"
+            )
+            
+            # Vorschau der formatierten Nummer
+            if phone:
+                formatted_phone = sms_client.format_phone_number(phone)
+                if formatted_phone:
+                    st.caption(f"📱 Formatiert: {formatted_phone}")
+                else:
+                    st.caption("⚠️ Ungültiges Format - bitte prüfen")
+            
+            st.divider()
+            
+            # Read-Only Felder
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input("Rolle", value=user.get('role', 'user'), disabled=True)
+            with col2:
+                created = user.get('created_at')
+                if created and hasattr(created, 'strftime'):
+                    created_str = created.strftime('%d.%m.%Y')
+                else:
+                    created_str = "N/A"
+                st.text_input("Mitglied seit", value=created_str, disabled=True)
+            
+            # Speichern-Button
+            submit = st.form_submit_button("💾 Änderungen speichern", use_container_width=True, type="primary")
+            
+            if submit:
+                # Validierung
+                if not name or not email:
+                    st.error("❌ Name und E-Mail sind Pflichtfelder!")
+                elif len(name) < 2:
+                    st.error("❌ Name muss mindestens 2 Zeichen haben")
+                elif '@' not in email or '.' not in email:
+                    st.error("❌ Ungültige E-Mail-Adresse")
+                else:
+                    # Prüfe ob E-Mail bereits von anderem User verwendet wird
+                    existing_user = ww_db.get_user(email)
+                    if existing_user and existing_user.get('id') != user['id']:
+                        st.error(f"❌ E-Mail-Adresse '{email}' wird bereits verwendet!")
+                    else:
+                        # Speichern
+                        success = ww_db.update_user(
+                            user['id'],
+                            name=name,
+                            email=email,
+                            phone=phone
+                        )
+                        
+                        if success:
+                            # Session aktualisieren
+                            st.session_state.user['name'] = name
+                            st.session_state.user['email'] = email
+                            st.session_state.user['phone'] = phone
+                            
+                            st.success("✅ Profil erfolgreich aktualisiert!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Fehler beim Speichern")
+    
+    # ===== TAB 2: BENACHRICHTIGUNGEN =====
+    with tab2:
+        st.subheader("Benachrichtigungs-Einstellungen")
+        st.caption("Wählen Sie, welche Benachrichtigungen Sie erhalten möchten")
+        
+        with st.form("benachrichtigungen"):
+            st.markdown("### ✉️ E-Mail-Benachrichtigungen")
+            
+            email_booking = st.checkbox(
+                "Buchungsbestätigungen",
+                value=user.get('email_notifications_booking', True),
+                help="E-Mail bei jeder neuen Buchung"
+            )
+            
+            email_reminder = st.checkbox(
+                "Erinnerungen (24h vorher)",
+                value=user.get('email_notifications_reminder', True),
+                help="E-Mail-Erinnerung 24h vor Ihrem Dienst"
+            )
+            
+            email_cancellation = st.checkbox(
+                "Stornierungen",
+                value=user.get('email_notifications_cancellation', True),
+                help="E-Mail bei Stornierung"
+            )
+            
+            st.divider()
+            st.markdown("### 📱 SMS-Benachrichtigungen")
+            
+            if not user.get('phone'):
+                st.info("💡 Tipp: Hinterlegen Sie eine Telefonnummer unter 'Profil-Info', um SMS zu erhalten.")
+            
+            sms_booking = st.checkbox(
+                "Buchungsbestätigungen",
+                value=user.get('sms_notifications_booking', False),
+                help="SMS bei jeder neuen Buchung",
+                disabled=not user.get('phone')
+            )
+            
+            sms_reminder = st.checkbox(
+                "Erinnerungen",
+                value=user.get('sms_notifications_reminder', False),
+                help="SMS-Erinnerung vor Ihrem Dienst",
+                disabled=not user.get('phone')
+            )
+            
+            st.divider()
+            
+            # Speichern-Button
+            submit = st.form_submit_button("💾 Einstellungen speichern", use_container_width=True, type="primary")
+            
+            if submit:
+                success = ww_db.update_user(
+                    user['id'],
+                    email_notifications_booking=email_booking,
+                    email_notifications_reminder=email_reminder,
+                    email_notifications_cancellation=email_cancellation,
+                    sms_notifications_booking=sms_booking,
+                    sms_notifications_reminder=sms_reminder
+                )
+                
+                if success:
+                    # Session aktualisieren
+                    st.session_state.user['email_notifications_booking'] = email_booking
+                    st.session_state.user['email_notifications_reminder'] = email_reminder
+                    st.session_state.user['email_notifications_cancellation'] = email_cancellation
+                    st.session_state.user['sms_notifications_booking'] = sms_booking
+                    st.session_state.user['sms_notifications_reminder'] = sms_reminder
+                    
+                    st.success("✅ Einstellungen gespeichert!")
+                    st.rerun()
+                else:
+                    st.error("❌ Fehler beim Speichern")
+    
+    # ===== TAB 3: SICHERHEIT (PASSWORT ÄNDERN) =====
+    with tab3:
+        st.subheader("Passwort ändern")
+        st.caption("Ändern Sie hier Ihr Passwort")
+        
+        with st.form("passwort_aendern"):
+            old_password = st.text_input(
+                "Aktuelles Passwort",
+                type="password",
+                help="Geben Sie Ihr aktuelles Passwort ein"
+            )
+            
+            new_password = st.text_input(
+                "Neues Passwort",
+                type="password",
+                help="Mindestens 6 Zeichen"
+            )
+            
+            new_password_confirm = st.text_input(
+                "Neues Passwort bestätigen",
+                type="password",
+                help="Wiederholen Sie das neue Passwort"
+            )
+            
+            st.divider()
+            
+            # Speichern-Button
+            submit = st.form_submit_button("🔒 Passwort ändern", use_container_width=True, type="primary")
+            
+            if submit:
+                # Validierung
+                if not old_password or not new_password or not new_password_confirm:
+                    st.error("❌ Bitte alle Felder ausfüllen!")
+                elif hash_pw(old_password) != user.get('password_hash'):
+                    st.error("❌ Aktuelles Passwort ist falsch!")
+                elif new_password != new_password_confirm:
+                    st.error("❌ Neue Passwörter stimmen nicht überein!")
+                elif len(new_password) < 6:
+                    st.error("❌ Passwort muss mindestens 6 Zeichen haben!")
+                elif old_password == new_password:
+                    st.error("❌ Neues Passwort muss sich vom alten unterscheiden!")
+                else:
+                    # Passwort ändern
+                    success = ww_db.update_user(
+                        user['id'],
+                        password_hash=hash_pw(new_password)
+                    )
+                    
+                    if success:
+                        # Session aktualisieren
+                        st.session_state.user['password_hash'] = hash_pw(new_password)
+                        
+                        st.success("✅ Passwort erfolgreich geändert!")
+                        st.balloons()
+                    else:
+                        st.error("❌ Fehler beim Ändern des Passworts")
+
+# ===== STATISTIK =====
+def statistik_page():
+    st.title("📊 Statistik")
+    
+    # Lade alle Buchungen
+    all_bookings = []
+    try:
+        for doc in db.collection('bookings').where('status', '==', 'confirmed').stream():
+            b = doc.to_dict()
+            b['id'] = doc.id
+            all_bookings.append(b)
+    except:
+        st.error("Fehler beim Laden der Statistiken")
+        return
+    
+    if not all_bookings:
+        st.info("Noch keine Buchungen vorhanden.")
+        return
+    
+    # Top Helfer
+    st.subheader("🏆 Top Helfer")
+    user_counts = Counter([b['user_name'] for b in all_bookings])
+    top_10 = user_counts.most_common(10)
+    
+    if top_10:
+        df_top = pd.DataFrame(top_10, columns=['Name', 'Anzahl Dienste'])
+        fig = px.bar(df_top, x='Name', y='Anzahl Dienste', title='Top 10 Helfer')
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Buchungen pro Monat
+    st.subheader("📅 Buchungen pro Monat")
+    monthly = Counter([b['slot_date'][:7] for b in all_bookings])
+    df_month = pd.DataFrame(sorted(monthly.items()), columns=['Monat', 'Anzahl'])
+    fig_month = px.line(df_month, x='Monat', y='Anzahl', title='Buchungen pro Monat')
+    st.plotly_chart(fig_month, use_container_width=True)
+# ===== VERWALTUNG (ADMIN) =====
+# ===== VERWALTUNG (ADMIN) - ERWEITERT MIT FREIEN SLOTS =====
+# ===== VERWALTUNG (ADMIN) - KOMPLETT MIT ADMIN-BUCHUNG =====
+def verwaltung_page():
+    st.title("⚙️ Verwaltung")
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📋 Alle Buchungen", 
+        "🔍 Freie Slots", 
+        "👥 Admin-Buchung", 
+        "🗑️ Archivieren", 
+        "⚙️ Einstellungen"
+    ])
+    
+    # ===== TAB 1: ALLE BUCHUNGEN (wie gehabt) =====
+    with tab1:
+        st.subheader("Alle Buchungen")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            filter_status = st.selectbox("Status", ["alle", "confirmed", "cancelled"])
+        with col2:
+            filter_future = st.checkbox("Nur zukünftige", value=True)
+        
+        try:
+            query = db.collection('bookings')
+            if filter_status != "alle":
+                query = query.where('status', '==', filter_status)
+            
+            all_bookings = []
+            for doc in query.stream():
+                b = doc.to_dict()
+                b['id'] = doc.id
+                all_bookings.append(b)
+            
+            if filter_future:
+                today = datetime.now().date().strftime("%Y-%m-%d")
+                all_bookings = [b for b in all_bookings if b.get('slot_date', '') >= today]
+            
+            all_bookings.sort(key=lambda x: x.get('slot_date', ''), reverse=True)
+            
+            if not all_bookings:
+                st.info("Keine Buchungen gefunden.")
+            else:
+                st.write(f"**{len(all_bookings)} Buchungen gefunden**")
+                
+                for booking in all_bookings:
+                    with st.expander(
+                        f"{fmt_de(booking.get('slot_date', 'N/A'))} - {booking.get('user_name', 'N/A')} ({booking.get('status', 'N/A')})"
+                    ):
+                        col_a, col_b = st.columns([3, 1])
+                        
+                        with col_a:
+                            st.markdown(f"**📅 Datum:** {fmt_de(booking.get('slot_date', 'N/A'))}")
+                            st.markdown(f"**⏰ Zeit:** {booking.get('slot_time', 'N/A')}")
+                            st.markdown(f"**👤 Name:** {booking.get('user_name', 'N/A')}")
+                            st.markdown(f"**📧 E-Mail:** {booking.get('user_email', 'N/A')}")
+                            if booking.get('user_phone'):
+                                st.markdown(f"**📱 Telefon:** {booking.get('user_phone')}")
+                            st.markdown(f"**Status:** {booking.get('status', 'N/A')}")
+                        
+                        with col_b:
+                            if booking.get('status') == 'confirmed':
+                                if st.button("❌ Stornieren", key=f"admin_cancel_{booking['id']}"):
+                                    if ww_db.cancel_booking(booking['id'], 'admin'):
+                                        st.success("✅ Storniert")
+                                        st.rerun()
+                            
+                            if st.button("🗑️ Löschen", key=f"admin_del_{booking['id']}"):
+                                try:
+                                    db.collection('bookings').document(booking['id']).delete()
+                                    st.success("✅ Gelöscht")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Fehler: {e}")
+        
+        except Exception as e:
+            st.error(f"Fehler beim Laden: {e}")
+    
+    # ===== TAB 2: FREIE SLOTS (wie zuvor erstellt) =====
+    with tab2:
+        st.subheader("🔍 Freie Slots in den nächsten 4 Wochen")
+        st.caption("Übersicht über alle noch nicht gebuchten Schichten")
+        
+        today = datetime.now().date()
+        weeks_ahead = 4
+        end_date = today + timedelta(days=7 * weeks_ahead)
+        
+        all_slots = []
+        current_week = week_start(today)
+        
+        for week_offset in range(weeks_ahead):
+            ws = current_week + timedelta(days=7 * week_offset)
+            
+            for slot_config in WEEKLY_SLOTS:
+                slot_d = slot_date(ws, slot_config['day'])
+                slot_date_obj = datetime.strptime(slot_d, '%Y-%m-%d').date()
+                
+                if slot_date_obj < today:
+                    continue
+                
+                if is_blocked(slot_d):
+                    continue
+                
+                slot_time = f"{slot_config['start']} - {slot_config['end']}"
+                booking = ww_db.get_booking(slot_d, slot_time)
+                
+                if not booking:
+                    days_until = (slot_date_obj - today).days
+                    
+                    if days_until < 7:
+                        color = "🔴"
+                        urgency = "kritisch"
+                    elif days_until < 14:
+                        color = "🟠"
+                        urgency = "achtung"
+                    else:
+                        color = "🟢"
+                        urgency = "entspannt"
+                    
+                    all_slots.append({
+                        'date': slot_d,
+                        'date_obj': slot_date_obj,
+                        'weekday': slot_config['day_name'],
+                        'time': slot_time,
+                        'days_until': days_until,
+                        'color': color,
+                        'urgency': urgency
+                    })
+        
+        all_slots.sort(key=lambda x: x['date'])
+        
+        if all_slots:
+            st.markdown("### 📊 Zusammenfassung")
+            
+            kritisch = len([s for s in all_slots if s['urgency'] == 'kritisch'])
+            achtung = len([s for s in all_slots if s['urgency'] == 'achtung'])
+            entspannt = len([s for s in all_slots if s['urgency'] == 'entspannt'])
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Gesamt", len(all_slots))
+            with col2:
+                st.metric("🔴 Kritisch", kritisch)
+            with col3:
+                st.metric("🟠 Achtung", achtung)
+            with col4:
+                st.metric("🟢 Entspannt", entspannt)
+            
+            st.divider()
+            
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                df = pd.DataFrame([{
+                    'Datum': fmt_de(s['date']),
+                    'Wochentag': s['weekday'],
+                    'Uhrzeit': s['time'],
+                    'Tage bis Slot': s['days_until'],
+                    'Dringlichkeit': s['urgency']
+                } for s in all_slots])
+                
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    "📥 Als CSV exportieren",
+                    csv,
+                    file_name=f"freie_slots_{today.strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            with col_b:
+                if st.button("📧 Per E-Mail senden", use_container_width=True):
+                    if mailer.admin_receiver:
+                        email_body = f"""Freie Slots - Übersicht vom {today.strftime('%d.%m.%Y')}
+
+Gesamt: {len(all_slots)} freie Slots
+🔴 Kritisch: {kritisch}
+🟠 Achtung: {achtung}
+🟢 Entspannt: {entspannt}
+
+Details:
+---
+
+"""
+                        for s in all_slots:
+                            email_body += f"{s['color']} {fmt_de(s['date'])} ({s['weekday']}) - {s['time']} - in {s['days_until']} Tagen\n"
+                        
+                        csv_bytes = csv.encode('utf-8')
+                        
+                        success, msg = mailer.send(
+                            mailer.admin_receiver,
+                            f"🔍 Freie Slots - {today.strftime('%d.%m.%Y')}",
+                            email_body,
+                            attachments=[(f"freie_slots_{today.strftime('%Y%m%d')}.csv", csv_bytes)]
+                        )
+                        
+                        if success:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+                    else:
+                        st.error("❌ Keine Admin-E-Mail konfiguriert")
+            
+            st.divider()
+            st.markdown("### 📋 Details")
+            
+            for slot in all_slots:
+                with st.container():
+                    col1, col2, col3, col4 = st.columns([1, 3, 3, 2])
+                    
+                    with col1:
+                        st.markdown(f"### {slot['color']}")
+                    with col2:
+                        st.markdown(f"**{fmt_de(slot['date'])}**")
+                        st.caption(slot['weekday'])
+                    with col3:
+                        st.markdown(f"**{slot['time']}**")
+                        st.caption(f"in {slot['days_until']} Tagen")
+                    with col4:
+                        if slot['urgency'] == 'kritisch':
+                            st.error("Dringend!")
+                        elif slot['urgency'] == 'achtung':
+                            st.warning("Bald fällig")
+                        else:
+                            st.success("Zeit vorhanden")
+                    
+                    st.divider()
+        else:
+            st.success("🎉 Alle Slots in den nächsten 4 Wochen sind gebucht!")
+    
+    # ===== TAB 3: ADMIN-BUCHUNG (NEU) =====
+    with tab3:
+        st.subheader("👥 Schichten für User buchen & umbuchen")
+        
+        sub_tab1, sub_tab2 = st.tabs(["➕ Neue Buchung", "🔄 Umbuchung"])
+        
+        # --- SUB-TAB 1: NEUE BUCHUNG ---
+        with sub_tab1:
+            st.markdown("### Neue Buchung für User erstellen")
+            st.caption("Buchen Sie eine Schicht im Namen eines Users")
+            
+            with st.form("admin_neue_buchung"):
+                # User auswählen
+                all_users = ww_db.get_all_users()
+                active_users = [u for u in all_users if u.get('active', True)]
+                
+                if not active_users:
+                    st.error("Keine aktiven User gefunden!")
+                else:
+                    user_options = {f"{u['name']} ({u['email']})": u for u in active_users}
+                    selected_user_str = st.selectbox(
+                        "User auswählen",
+                        options=list(user_options.keys()),
+                        help="Wählen Sie den User, für den Sie buchen möchten"
+                    )
+                    selected_user = user_options[selected_user_str]
+                    
+                    # Datum & Zeit
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Wähle Woche
+                        today = datetime.now().date()
+                        weeks = []
+                        for i in range(8):  # Nächsten 8 Wochen
+                            ws = week_start(today + timedelta(days=7*i))
+                            weeks.append((f"KW {ws.isocalendar()[1]} ({fmt_de(ws)})", ws))
+                        
+                        selected_week_str = st.selectbox(
+                            "Woche auswählen",
+                            options=[w[0] for w in weeks]
+                        )
+                        selected_week = [w[1] for w in weeks if w[0] == selected_week_str][0]
+                    
+                    with col2:
+                        # Verfügbare Slots für diese Woche
+                        available_slots = []
+                        for slot_config in WEEKLY_SLOTS:
+                            slot_d = slot_date(selected_week, slot_config['day'])
+                            slot_date_obj = datetime.strptime(slot_d, '%Y-%m-%d').date()
+                            
+                            if slot_date_obj < today:
+                                continue
+                            
+                            slot_time = f"{slot_config['start']} - {slot_config['end']}"
+                            booking = ww_db.get_booking(slot_d, slot_time)
+                            blocked = is_blocked(slot_d)
+                            
+                            label = f"{slot_config['day_name']} {fmt_de(slot_d)} | {slot_time}"
+                            
+                            if booking:
+                                label += f" (Gebucht: {booking['user_name']})"
+                                available_slots.append((label, slot_d, slot_time, True, booking))
+                            elif blocked:
+                                label += f" (Blockiert: {block_reason(slot_d)})"
+                                available_slots.append((label, slot_d, slot_time, True, None))
+                            else:
+                                label += " (Frei)"
+                                available_slots.append((label, slot_d, slot_time, False, None))
+                        
+                        if not available_slots:
+                            st.warning("Keine Slots in dieser Woche verfügbar")
+                        else:
+                            selected_slot_str = st.selectbox(
+                                "Slot auswählen",
+                                options=[s[0] for s in available_slots]
+                            )
+                            selected_slot = [s for s in available_slots if s[0] == selected_slot_str][0]
+                    
+                    # Optionen
+                    notify_user = st.checkbox("User per E-Mail/SMS benachrichtigen", value=True)
+                    
+                    # Submit
+                    submit = st.form_submit_button("📝 Buchung erstellen", use_container_width=True, type="primary")
+                    
+                    if submit:
+                        slot_d = selected_slot[1]
+                        slot_time = selected_slot[2]
+                        is_occupied = selected_slot[3]
+                        
+                        if is_occupied:
+                            st.error("❌ Dieser Slot ist bereits gebucht oder blockiert!")
+                        else:
+                            # Buchung erstellen
+                            success, msg = ww_db.create_booking(
+                                slot_d,
+                                slot_time,
+                                selected_user['email'],
+                                selected_user['name'],
+                                selected_user.get('phone', '')
+                            )
+                            
+                            if success:
+                                st.success(f"✅ Buchung erstellt für {selected_user['name']}!")
+                                
+                                # Benachrichtigung
+                                if notify_user:
+                                    # E-Mail
+                                    email_success, email_msg = mailer.send_booking_confirmation(
+                                        selected_user['email'],
+                                        selected_user['name'],
+                                        slot_d,
+                                        slot_time
+                                    )
+                                    if email_success:
+                                        st.info(f"📧 {email_msg}")
+                                    
+                                    # SMS
+                                    if selected_user.get('phone') and selected_user.get('sms_notifications_booking'):
+                                        sms_success, sms_msg = sms_client.send_booking_confirmation(
+                                            selected_user['phone'],
+                                            selected_user['name'],
+                                            slot_d,
+                                            slot_time
+                                        )
+                                        if sms_success:
+                                            st.info(f"📱 {sms_msg}")
+                                
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {msg}")
+        
+        # --- SUB-TAB 2: UMBUCHUNG ---
+        with sub_tab2:
+            st.markdown("### Bestehende Buchung umbuchen")
+            st.caption("Übertragen Sie eine Buchung von einem User auf einen anderen")
+            
+            with st.form("admin_umbuchung"):
+                # Zukünftige Buchungen laden
+                today = datetime.now().date().strftime("%Y-%m-%d")
+                future_bookings = []
+                
+                try:
+                    for doc in db.collection('bookings').where('status', '==', 'confirmed').stream():
+                        b = doc.to_dict()
+                        b['id'] = doc.id
+                        if b.get('slot_date', '') >= today:
+                            future_bookings.append(b)
+                except:
+                    pass
+                
+                if not future_bookings:
+                    st.info("Keine zukünftigen Buchungen vorhanden")
+                else:
+                    # Sortieren
+                    future_bookings.sort(key=lambda x: x['slot_date'])
+                    
+                    # Buchung auswählen
+                    booking_options = {
+                        f"{fmt_de(b['slot_date'])} | {b['slot_time']} | {b['user_name']}": b
+                        for b in future_bookings
+                    }
+                    
+                    selected_booking_str = st.selectbox(
+                        "Buchung auswählen",
+                        options=list(booking_options.keys()),
+                        help="Wählen Sie die Buchung, die umgebucht werden soll"
+                    )
+                    selected_booking = booking_options[selected_booking_str]
+                    
+                    st.info(f"**Aktuell gebucht von:** {selected_booking['user_name']} ({selected_booking['user_email']})")
+                    
+                    # Neuen User auswählen
+                    all_users = ww_db.get_all_users()
+                    active_users = [u for u in all_users if u.get('active', True) and u['email'] != selected_booking['user_email']]
+                    
+                    if not active_users:
+                        st.error("Keine anderen User verfügbar!")
+                    else:
+                        user_options = {f"{u['name']} ({u['email']})": u for u in active_users}
+                        new_user_str = st.selectbox(
+                            "Neuer User",
+                            options=list(user_options.keys()),
+                            help="Wählen Sie den neuen User für diese Buchung"
+                        )
+                        new_user = user_options[new_user_str]
+                        
+                        # Kommentar
+                        comment = st.text_area(
+                            "Kommentar (optional)",
+                            placeholder="z.B. 'Krankheit', 'Urlaub', 'Tausch', etc.",
+                            help="Grund für die Umbuchung (wird in Benachrichtigung erwähnt)"
+                        )
+                        
+                        # Benachrichtigung
+                        notify_users = st.checkbox("Beide User benachrichtigen", value=True)
+                        
+                        # Submit
+                        submit = st.form_submit_button("🔄 Umbuchung durchführen", use_container_width=True, type="primary")
+                        
+                        if submit:
+                            # Alte Buchung löschen
+                            try:
+                                db.collection('bookings').document(selected_booking['id']).delete()
+                            except:
+                                st.error("Fehler beim Löschen der alten Buchung")
+                                st.stop()
+                            
+                            # Neue Buchung erstellen
+                            success, msg = ww_db.create_booking(
+                                selected_booking['slot_date'],
+                                selected_booking['slot_time'],
+                                new_user['email'],
+                                new_user['name'],
+                                new_user.get('phone', '')
+                            )
+                            
+                            if success:
+                                st.success(f"✅ Umbuchung erfolgreich! Slot wurde von {selected_booking['user_name']} auf {new_user['name']} übertragen.")
+                                
+                                # Benachrichtigungen
+                                if notify_users:
+                                    # Alter User: Stornierung
+                                    mailer.send_cancellation(
+                                        selected_booking['user_email'],
+                                        selected_booking['user_name'],
+                                        selected_booking['slot_date'],
+                                        selected_booking['slot_time']
+                                    )
+                                    
+                                    # Neuer User: Buchungsbestätigung
+                                    mailer.send_booking_confirmation(
+                                        new_user['email'],
+                                        new_user['name'],
+                                        selected_booking['slot_date'],
+                                        selected_booking['slot_time']
+                                    )
+                                    
+                                    if comment:
+                                        st.info(f"💬 Kommentar: {comment}")
+                                    
+                                    st.info("📧 Beide User wurden benachrichtigt")
+                                
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Fehler bei neuer Buchung: {msg}")
+    
+    # ===== TAB 4: ARCHIVIEREN (wie gehabt) =====
+    with tab4:
+        st.subheader("🗑️ Alte Buchungen archivieren")
+        st.info("Buchungen älter als 12 Monate werden archiviert.")
+        
+        if st.button("Archivierung starten"):
+            count = ww_db.archive_old()
+            if count > 0:
+                st.success(f"✅ {count} Buchungen archiviert")
+            else:
+                st.info("Keine Buchungen zum Archivieren gefunden")
+    
+    # ===== TAB 5: EINSTELLUNGEN (wie gehabt) =====
+    with tab5:
+        st.subheader("⚙️ Systemeinstellungen")
+        
+        dark = ww_db.get_setting('dark_mode', 'false') == 'true'
+        new_dark = st.checkbox("Dark Mode (Global)", value=dark)
+        if new_dark != dark:
+            ww_db.set_setting('dark_mode', 'true' if new_dark else 'false')
+            st.success("✅ Gespeichert")
+            st.rerun()
+
+# ===== BENUTZERVERWALTUNG (ADMIN) =====
+def benutzer_page():
+    st.title("👥 Benutzerverwaltung")
+    
+    users = ww_db.get_all_users()
+    
+    tab1, tab2 = st.tabs(["📋 Alle Benutzer", "➕ Neuer Benutzer"])
+    
+    with tab1:
+        st.markdown(f"**Gesamt:** {len(users)} Benutzer")
+        
+        # Filter
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            search = st.text_input("🔍 Suche nach Name oder E-Mail", "")
+        with col2:
+            role_filter = st.selectbox("Filter Rolle", ["Alle", "user", "admin"])
+        
+        # Gefilterte Liste
+        filtered = users
+        if search:
+            filtered = [u for u in users if search.lower() in u.get('name', '').lower() 
+                       or search.lower() in u.get('email', '').lower()]
+        if role_filter != "Alle":
+            filtered = [u for u in filtered if u.get('role') == role_filter]
+        
+        st.markdown(f"**Angezeigt:** {len(filtered)} Benutzer")
+        st.divider()
+        
+        # User-Liste
+        for u in sorted(filtered, key=lambda x: x.get('name', '')):
+            with st.container():
+                col1, col2, col3 = st.columns([3, 2, 3])
+                
+                with col1:
+                    status_icon = "✅" if u.get('active', True) else "❌"
+                    role_badge = "🔑 Admin" if u.get('role') == 'admin' else "👤 User"
+                    
+                    st.markdown(f"**{status_icon} {u.get('name', 'N/A')}** {role_badge}")
+                    st.caption(f"📧 {u.get('email', 'N/A')} | 📱 {u.get('phone', '-')}")
+                
+                with col2:
+                    # Statistik
+                    bookings = ww_db.get_user_bookings(u.get('email'), future_only=False)
+                    st.metric("Buchungen", len(bookings))
+                
+                with col3:
+                    # Action Buttons - NEU: 4 Buttons inkl. Edit und PW-Reset
+                    btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+                    
+                    with btn_col1:
+                        if st.button("✏️", key=f"edit_{u['id']}", help="Bearbeiten"):
+                            st.session_state[f'edit_user_{u["id"]}'] = True
+                            st.rerun()
+                    
+                    with btn_col2:
+                        active = u.get('active', True)
+                        toggle_label = "🔓" if not active else "🔒"
+                        toggle_help = "Aktivieren" if not active else "Deaktivieren"
+                        if st.button(toggle_label, key=f"toggle_{u['id']}", help=toggle_help):
+                            ww_db.update_user(u['id'], active=not active)
+                            st.success(f"✅ User {'aktiviert' if not active else 'deaktiviert'}")
+                            st.rerun()
+                    
+                    with btn_col3:
+                        # NEU: Password Reset Button
+                        if st.button("🔑", key=f"pwreset_{u['id']}", help="Passwort zurücksetzen"):
+                            st.session_state[f'confirm_reset_{u["id"]}'] = True
+                            st.rerun()
+                    
+                    with btn_col4:
+                        if st.button("🗑️", key=f"del_{u['id']}", help="Löschen"):
+                            st.session_state[f'confirm_delete_{u["id"]}'] = True
+                            st.rerun()
+                
+                # NEU: Password Reset Confirmation Modal
+                if st.session_state.get(f'confirm_reset_{u["id"]}', False):
+                    with st.form(f"reset_confirm_form_{u['id']}"):
+                        st.warning(f"⚠️ **Passwort zurücksetzen für {u.get('name')}?**")
+                        st.info("""
+**Was passiert:**
+1. Ein neues, zufälliges Passwort wird generiert (8 Zeichen)
+2. Der User erhält eine E-Mail mit dem neuen Passwort
+3. Der User wird aufgefordert, sein Passwort nach dem Login zu ändern
+                        """)
+                        
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            if st.form_submit_button("✅ Ja, zurücksetzen", type="primary", use_container_width=True):
+                                # Trigger Password Reset
+                                success, new_pw = ww_db.trigger_password_reset(u['id'])
+                                
+                                if success and new_pw:
+                                    # Email senden
+                                    email_success, email_msg = mailer.send_password_reset(
+                                        u.get('email'),
+                                        u.get('name'),
+                                        new_pw
+                                    )
+                                    
+                                    if email_success:
+                                        st.success(f"✅ Passwort zurückgesetzt! E-Mail an {u.get('email')} gesendet.")
+                                        st.info(f"🔑 **Neues Passwort (für Notfälle):** `{new_pw}`")
+                                        st.caption("☝️ Bitte notiere das Passwort, falls der User die E-Mail nicht erhält.")
+                                    else:
+                                        st.error(f"❌ Passwort zurückgesetzt, aber E-Mail-Versand fehlgeschlagen!")
+                                        st.warning(f"⚠️ **Bitte gib dem User manuell das Passwort:** `{new_pw}`")
+                                    
+                                    del st.session_state[f'confirm_reset_{u["id"]}']
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Fehler beim Zurücksetzen des Passworts")
+                        
+                        with col_b:
+                            if st.form_submit_button("❌ Abbrechen", use_container_width=True):
+                                del st.session_state[f'confirm_reset_{u["id"]}']
+                                st.rerun()
+                
+                # Delete Confirmation Modal
+                if st.session_state.get(f'confirm_delete_{u["id"]}', False):
+                    with st.form(f"delete_confirm_form_{u['id']}"):
+                        st.error(f"⚠️ **User {u.get('name')} wirklich löschen?**")
+                        st.warning("Diese Aktion kann nicht rückgängig gemacht werden!")
+                        
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            if st.form_submit_button("✅ Ja, löschen", type="primary", use_container_width=True):
+                                ww_db.delete_user(u['id'])
+                                st.success(f"✅ User {u.get('name')} gelöscht")
+                                del st.session_state[f'confirm_delete_{u["id"]}']
+                                st.rerun()
+                        with col_b:
+                            if st.form_submit_button("❌ Abbrechen", use_container_width=True):
+                                del st.session_state[f'confirm_delete_{u["id"]}']
+                                st.rerun()
+                
+                # Edit Modal
+                if st.session_state.get(f'edit_user_{u["id"]}', False):
+                    with st.form(f"edit_form_{u['id']}"):
+                        st.markdown(f"### ✏️ Bearbeiten: {u.get('name')}")
+                        
+                        edit_name = st.text_input("Name", value=u.get('name', ''))
+                        edit_email = st.text_input("E-Mail", value=u.get('email', ''), disabled=True)
+                        edit_phone = st.text_input("Telefon", value=u.get('phone', ''))
+                        edit_role = st.selectbox("Rolle", ["user", "admin"], 
+                                                index=0 if u.get('role') == 'user' else 1)
+                        
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            if st.form_submit_button("💾 Speichern", type="primary", use_container_width=True):
+                                ww_db.update_user(u['id'], name=edit_name, phone=edit_phone, role=edit_role)
+                                st.success("✅ Gespeichert!")
+                                del st.session_state[f'edit_user_{u["id"]}']
+                                st.rerun()
+                        with col_b:
+                            if st.form_submit_button("❌ Abbrechen", use_container_width=True):
+                                del st.session_state[f'edit_user_{u["id"]}']
+                                st.rerun()
+                
+                st.divider()
+    
+    with tab2:
+        # Neuer User erstellen
+        with st.form("create_user_admin"):
+            st.markdown("### ➕ Neuen Benutzer erstellen")
+            
+            new_name = st.text_input("Name*")
+            new_email = st.text_input("E-Mail*")
+            new_phone = st.text_input("Telefon")
+            new_pw = st.text_input("Passwort*", type="password", value="")
+            new_role = st.selectbox("Rolle", ["user", "admin"])
+            
+            if st.form_submit_button("✅ Benutzer erstellen", type="primary", use_container_width=True):
+                if not new_name or not new_email or not new_pw:
+                    st.error("❌ Name, E-Mail und Passwort sind Pflichtfelder")
+                elif len(new_pw) < 6:
+                    st.error("❌ Passwort muss mindestens 6 Zeichen haben")
+                else:
+                    success, msg = ww_db.create_user(new_email, new_name, new_phone, new_pw, role=new_role)
+                    if success:
+                        st.success(f"✅ {msg}")
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+
+# ===== EXPORT (ADMIN) =====
+def export_page():
+    st.title("💾 Export & Backup")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📥 Daten exportieren")
+        
+        if st.button("📄 Buchungen exportieren (JSON)", use_container_width=True):
+            try:
+                bookings = []
+                for doc in db.collection('bookings').stream():
+                    b = doc.to_dict()
+                    b['id'] = doc.id
+                    # Firestore Timestamps zu Strings
+                    for key in b:
+                        if hasattr(b[key], 'strftime'):
+                            b[key] = b[key].strftime('%Y-%m-%d %H:%M:%S')
+                    bookings.append(b)
+                
+                json_str = json.dumps(bookings, indent=2, ensure_ascii=False)
+                st.download_button(
+                    "⬇️ Download Buchungen",
+                    json_str,
+                    file_name=f"buchungen_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+            except Exception as e:
+                st.error(f"Fehler: {e}")
+        
+        if st.button("📄 Benutzer exportieren (JSON)", use_container_width=True):
+            try:
+                users = ww_db.get_all_users()
+                # Passwörter entfernen
+                users_export = [{k: v for k, v in u.items() if k != 'password_hash'} for u in users]
+                json_str = json.dumps(users_export, indent=2, ensure_ascii=False)
+                st.download_button(
+                    "⬇️ Download Benutzer",
+                    json_str,
+                    file_name=f"benutzer_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+            except Exception as e:
+                st.error(f"Fehler: {e}")
+        
+        if st.button("📊 Statistik exportieren (CSV)", use_container_width=True):
+            try:
+                bookings = []
+                for doc in db.collection('bookings').where('status', '==', 'confirmed').stream():
+                    bookings.append(doc.to_dict())
+                
+                if bookings:
+                    df = pd.DataFrame(bookings)
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        csv,
+                        file_name=f"statistik_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("Keine Daten vorhanden")
+            except Exception as e:
+                st.error(f"Fehler: {e}")
+    
+    with col2:
+        st.subheader("📧 E-Mail Backup")
+        
+        if st.button("📧 Backup per E-Mail senden", use_container_width=True):
+            if mailer.admin_receiver:
+                try:
+                    # Lade Daten
+                    bookings = []
+                    for doc in db.collection('bookings').stream():
+                        b = doc.to_dict()
+                        for key in b:
+                            if hasattr(b[key], 'strftime'):
+                                b[key] = b[key].strftime('%Y-%m-%d %H:%M:%S')
+                        bookings.append(b)
+                    
+                    users = ww_db.get_all_users()
+                    users_export = [{k: v for k, v in u.items() if k != 'password_hash'} for u in users]
+                    
+                    # ZIP erstellen
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr('buchungen.json', json.dumps(bookings, indent=2, ensure_ascii=False))
+                        zf.writestr('benutzer.json', json.dumps(users_export, indent=2, ensure_ascii=False))
+                    
+                    zip_buffer.seek(0)
+                    
+                    # E-Mail senden
+                    subject = f"Dienstplan Backup - {datetime.now().strftime('%d.%m.%Y')}"
+                    body = f"""
+                    <html><body>
+                    <h2 style="color:{COLORS['rot']};">🌊 Automatisches Backup</h2>
+                    <p><strong>Datum:</strong> {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
+                    <p><strong>Buchungen:</strong> {len(bookings)}</p>
+                    <p><strong>Benutzer:</strong> {len(users)}</p>
+                    </body></html>
+                    """
+                    
+                    success, msg = mailer.send(
+                        mailer.admin_receiver,
+                        subject,
+                        body,
+                        attachments=[(f"backup_{datetime.now().strftime('%Y%m%d')}.zip", zip_buffer.getvalue())]
+                    )
+                    
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                
+                except Exception as e:
+                    st.error(f"Fehler: {e}")
+            else:
+                st.error("❌ Keine Admin-E-Mail konfiguriert")
+
+# ===== DEBUG-PANEL (ADMIN) =====
+def debug_page():
+    st.title("🔧 Debug-Panel")
+    
+    tab1, tab2, tab3 = st.tabs(["📧 E-Mail Test", "📱 SMS Test", "⚙️ System-Info"])
+    
+    with tab1:
+        st.markdown("### 📧 E-Mail Test")
+        with st.form("email_test"):
+            test_email = st.text_input("Test E-Mail Adresse")
+            test_subject = st.text_input("Betreff", value="Test E-Mail")
+            test_body = st.text_area("Nachricht", value="Dies ist eine Test-E-Mail vom Wasserwacht Dienstplan.")
+            
+            if st.form_submit_button("📧 Test-E-Mail senden", use_container_width=True):
+                if test_email:
+                    success, msg = mailer.send(test_email, test_subject, test_body)
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Bitte E-Mail-Adresse eingeben")
+    
+    with tab2:
+        st.markdown("### 📱 SMS Test")
+        with st.form("sms_test"):
+            test_phone = st.text_input("Test Telefonnummer", placeholder="0172... oder +49172...")
+            test_sms_body = st.text_area("SMS Text", value="Test SMS vom Wasserwacht Dienstplan")
+            
+            if st.form_submit_button("📱 Test-SMS senden", use_container_width=True):
+                if test_phone:
+                    success, msg = sms_client.send(test_phone, test_sms_body)
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Bitte Telefonnummer eingeben")
+    
+    with tab3:
+        st.markdown("### ⚙️ System-Info")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**SMTP Konfiguration:**")
+            st.code(f"""
+Server: {mailer.server}
+Port: {mailer.port}
+User: {mailer.user[:15]}...
+Password: {'✅ gesetzt' if mailer.pw else '❌ NICHT GESETZT'}
+Admin: {mailer.admin_receiver}
+            """)
+        
+        with col2:
+            st.markdown("**Twilio Konfiguration:**")
+            st.code(f"""
+Enabled: {sms_client.enabled}
+Account SID: {sms_client.account_sid[:15]}...
+Auth Token: {'✅ gesetzt' if sms_client.auth_token else '❌ NICHT GESETZT'}
+From Number: {sms_client.from_number}
+Client: {'✅ OK' if sms_client.client else '❌ FEHLER'}
+            """)
+        
+        st.markdown("**Firestore:**")
+        st.code(f"Verbindung: {'✅ OK' if db else '❌ FEHLER'}")
+        
+        st.markdown("**Benutzer in DB:**")
+        users_count = len(ww_db.get_all_users())
+        st.code(f"Anzahl: {users_count}")
+
+# ===== HANDBUCH (MIT EDIT-FUNKTION) =====
+def handbuch_page():
+    user = st.session_state.user
+    is_admin = user.get('role') == 'admin'
+    
+    st.title("📖 Handbuch")
+    
+    # Lade Handbuch-Inhalt aus Firestore
+    handbuch_content = ww_db.get_setting('handbuch_content', '')
+    
+    # Falls leer, verwende Default-Inhalt
+    if not handbuch_content:
+        handbuch_content = """
+## 🌊 Wasserwacht Dienstplan+ - Benutzerhandbuch
+
+### 📅 Schichten buchen
+
+1. **Kalender öffnen**: Gehen Sie zur Seite "📅 Kalender"
+2. **Woche auswählen**: Verwenden Sie die Pfeile ⬅️ ➡️ oder "Heute"
+3. **Schicht buchen**: Klicken Sie auf "📝 Buchen" bei einem verfügbaren Slot
+4. **Bestätigung**: Sie erhalten eine E-Mail-Bestätigung (und SMS, falls aktiviert)
+
+### 🚫 Blockierte Tage
+
+- **Feiertage**: An bayerischen Feiertagen sind keine Buchungen möglich
+- **Sommerpause**: Von Juni bis September pausiert der Dienst
+
+### 📋 Meine Buchungen
+
+- Sehen Sie alle Ihre zukünftigen und vergangenen Buchungen
+- Stornieren Sie Buchungen bis 24h vorher
+
+### 📊 Statistik
+
+- Sehen Sie Ihre Dienst-Statistiken
+- Top-10 Helfer Ranking
+- Monatliche Übersichten
+
+### ⚙️ Admin-Funktionen
+
+**Nur für Administratoren:**
+
+- **Verwaltung**: Alle Buchungen einsehen und verwalten
+- **Benutzer**: Benutzer erstellen, bearbeiten, löschen
+- **Export**: Daten exportieren als JSON/CSV
+- **Debug**: E-Mail und SMS testen
+- **Handbuch**: Dieses Handbuch bearbeiten
+
+### 💡 Tipps
+
+- Aktivieren Sie E-Mail-Benachrichtigungen in Ihrem Profil
+- Sie erhalten Erinnerungen 24h vor Ihrem Dienst
+- Bei Fragen kontaktieren Sie Ihren Administrator
+
+### 🔧 Support
+
+Bei Problemen kontaktieren Sie den Admin über: admin@wasserwacht.de
+        """
+    
+    # ADMIN: Bearbeiten-Modus
+    if is_admin:
+        tab1, tab2 = st.tabs(["📖 Ansicht", "✏️ Bearbeiten"])
+        
+        with tab1:
+            # Nur Anzeige
+            st.markdown(handbuch_content, unsafe_allow_html=True)
+        
+        with tab2:
+            st.info("💡 Verwenden Sie **Markdown** zur Formatierung. Änderungen werden für alle Benutzer gespeichert.")
+            
+            # Editor
+            edited_content = st.text_area(
+                "Handbuch-Inhalt (Markdown)",
+                value=handbuch_content,
+                height=500,
+                help="Verwenden Sie Markdown-Syntax: ## für Überschriften, ** für fett, * für kursiv, - für Listen"
+            )
+            
+            col1, col2, col3 = st.columns([2, 2, 6])
+            
+            with col1:
+                if st.button("💾 Speichern", use_container_width=True, type="primary"):
+                    if ww_db.set_setting('handbuch_content', edited_content):
+                        st.success("✅ Handbuch gespeichert!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Fehler beim Speichern")
+            
+            with col2:
+                if st.button("🔄 Zurücksetzen", use_container_width=True):
+                    st.info("Seite wird neu geladen...")
+                    st.rerun()
+            
+            # Live-Vorschau
+            with st.expander("👁️ Live-Vorschau", expanded=True):
+                st.markdown(edited_content, unsafe_allow_html=True)
+    
+    # USER: Nur Ansicht
+    else:
+        st.markdown(handbuch_content, unsafe_allow_html=True)
+        
+        st.divider()
+        st.caption("💡 Tipp: Haben Sie Fragen? Wenden Sie sich an Ihren Administrator.")
+
+# ===== IMPRESSUM (MIT EDIT-FUNKTION) =====
+def impressum_page():
+    user = st.session_state.user
+    is_admin = user.get('role') == 'admin'
+    
+    st.title("⚖️ Impressum")
+    
+    # Lade Impressum-Inhalt aus Firestore
+    impressum_content = ww_db.get_setting('impressum_content', '')
+    
+    # Falls leer, verwende Default-Inhalt
+    if not impressum_content:
+        impressum_content = """
+## ⚖️ Impressum
+
+### Angaben gemäß § 5 TMG
+
+**Wasserwacht [Ortsgruppe]**  
+[Straße und Hausnummer]  
+[PLZ] [Ort]
+
+### Vertreten durch:
+
+[Name des Verantwortlichen]  
+[Funktion/Rolle]
+
+### Kontakt:
+
+**Telefon:** [Telefonnummer]  
+**E-Mail:** [E-Mail-Adresse]  
+**Website:** [Website-URL]
+
+### Registereintrag:
+
+Eingetragen im Vereinsregister  
+**Registergericht:** [Amtsgericht]  
+**Registernummer:** [VR-Nummer]
+
+### Verantwortlich für den Inhalt nach § 55 Abs. 2 RStV:
+
+[Name]  
+[Adresse]
+
+### Haftungsausschluss:
+
+#### Haftung für Inhalte
+Die Inhalte unserer Seiten wurden mit größter Sorgfalt erstellt. Für die Richtigkeit, Vollständigkeit und Aktualität der Inhalte können wir jedoch keine Gewähr übernehmen.
+
+#### Haftung für Links
+Unser Angebot enthält Links zu externen Webseiten Dritter, auf deren Inhalte wir keinen Einfluss haben. Deshalb können wir für diese fremden Inhalte auch keine Gewähr übernehmen.
+
+#### Urheberrecht
+Die durch die Seitenbetreiber erstellten Inhalte und Werke auf diesen Seiten unterliegen dem deutschen Urheberrecht. Die Vervielfältigung, Bearbeitung, Verbreitung und jede Art der Verwertung außerhalb der Grenzen des Urheberrechtes bedürfen der schriftlichen Zustimmung des jeweiligen Autors bzw. Erstellers.
+
+### Datenschutz
+
+Informationen zum Datenschutz finden Sie in unserer [Datenschutzerklärung](#).
+
+---
+
+*Erstellt mit Wasserwacht Dienstplan+ v{0}*
+        """.format(VERSION)
+    
+    # ADMIN: Bearbeiten-Modus
+    if is_admin:
+        tab1, tab2 = st.tabs(["⚖️ Ansicht", "✏️ Bearbeiten"])
+        
+        with tab1:
+            # Nur Anzeige
+            st.markdown(impressum_content, unsafe_allow_html=True)
+        
+        with tab2:
+            st.info("💡 Verwenden Sie **Markdown** zur Formatierung. Passen Sie das Impressum an Ihre Organisation an.")
+            st.warning("⚠️ **WICHTIG:** Stellen Sie sicher, dass alle rechtlich erforderlichen Angaben vorhanden sind!")
+            
+            # Editor
+            edited_content = st.text_area(
+                "Impressum-Inhalt (Markdown)",
+                value=impressum_content,
+                height=600,
+                help="Verwenden Sie Markdown-Syntax: ## für Überschriften, ** für fett, [Text](URL) für Links"
+            )
+            
+            col1, col2, col3 = st.columns([2, 2, 6])
+            
+            with col1:
+                if st.button("💾 Speichern", use_container_width=True, type="primary"):
+                    if ww_db.set_setting('impressum_content', edited_content):
+                        st.success("✅ Impressum gespeichert!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Fehler beim Speichern")
+            
+            with col2:
+                if st.button("🔄 Zurücksetzen", use_container_width=True):
+                    st.info("Seite wird neu geladen...")
+                    st.rerun()
+            
+            # Live-Vorschau
+            with st.expander("👁️ Live-Vorschau", expanded=True):
+                st.markdown(edited_content, unsafe_allow_html=True)
+    
+    # USER: Nur Ansicht
+    else:
+        st.markdown(impressum_content, unsafe_allow_html=True)
+
+# ===== VORLAGEN / TEMPLATES (NUR ADMIN) =====
+def vorlagen_page():
+    st.title("📧 Nachrichten-Vorlagen")
+    
+    st.info("💡 Hier können Sie die E-Mail und SMS Templates anpassen. Verwenden Sie Platzhalter wie {name}, {date}, {time} für dynamische Inhalte.")
+    
+    # Template-Definitionen mit Defaults
+    templates = {
+        'email_booking': {
+            'name': '✉️ E-Mail - Buchungsbestätigung',
+            'type': 'email',
+            'default_subject': 'Buchungsbestätigung - {date}',
+            'default_body': """Hallo {name},
+
+deine Buchung wurde bestätigt:
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Bei Fragen melde dich gerne unter {org_email}.
+
+Viele Grüße,
+Dein {org_name} Team 🌊"""
+        },
+        'email_cancellation': {
+            'name': '✉️ E-Mail - Stornierung',
+            'type': 'email',
+            'default_subject': 'Stornierung - {date}',
+            'default_body': """Hallo {name},
+
+deine Buchung wurde storniert:
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Viele Grüße,
+Dein {org_name} Team 🌊"""
+        },
+        'email_reminder': {
+            'name': '✉️ E-Mail - Erinnerung',
+            'type': 'email',
+            'default_subject': '⏰ Erinnerung: Dienst morgen - {date}',
+            'default_body': """Hallo {name},
+
+dein Dienst ist morgen:
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Bis morgen!
+Dein {org_name} Team 🌊"""
+        },
+        'email_welcome': {
+            'name': '✉️ E-Mail - Willkommen (nach Registrierung)',
+            'type': 'email',
+            'default_subject': 'Willkommen bei {org_name}!',
+            'default_body': """Hallo {name},
+
+herzlich willkommen bei {org_name}! 🌊
+
+Dein Account wurde erfolgreich erstellt.
+Du kannst dich jetzt anmelden und Schichten buchen.
+
+📧 E-Mail: {email}
+🌐 Dashboard: [LINK ZUR APP]
+
+Bei Fragen erreichst du uns unter {org_email}.
+
+Viele Grüße,
+Dein {org_name} Team"""
+        },
+        'email_admin_notification': {
+            'name': '✉️ E-Mail - Admin-Benachrichtigung (neue Buchung)',
+            'type': 'email',
+            'default_subject': '🔔 Neue Buchung: {name} - {date}',
+            'default_body': """Neue Buchung im Dienstplan:
+
+👤 Name: {name}
+📧 E-Mail: {email}
+📱 Telefon: {phone}
+
+📅 Datum: {date}
+⏰ Uhrzeit: {time}
+
+Gebucht am: {current_date}"""
+        },
+        'email_password_reset': {
+            'name': '✉️ E-Mail - Passwort zurückgesetzt',
+            'type': 'email',
+            'default_subject': '🔐 Passwort zurückgesetzt - {org_name}',
+            'default_body': """Hallo {name},
+
+dein Passwort wurde von einem Administrator zurückgesetzt.
+
+🔑 **Dein neues temporäres Passwort:**
+{new_password}
+
+⚠️ **WICHTIG - Bitte beachten:**
+1. Verwende dieses Passwort für die nächste Anmeldung
+2. Ändere dein Passwort nach dem Login in ein persönliches, sicheres Passwort (im Profil unter "Sicherheit")
+3. Bewahre dieses Passwort sicher auf
+
+📧 Deine E-Mail: {email}
+
+Bei Fragen erreichst du uns unter {org_email}.
+
+Viele Grüße,
+Dein {org_name} Team 🌊
+
+---
+Gesendet am {current_date}"""
+        },
+        'sms_booking': {
+            'name': '📱 SMS - Buchungsbestätigung',
+            'type': 'sms',
+            'default_subject': None,
+            'default_body': """🌊 Buchung bestätigt: {name}
+📅 {date}
+⏰ {time}
+
+{org_name}"""
+        },
+        'sms_reminder': {
+            'name': '📱 SMS - Erinnerung',
+            'type': 'sms',
+            'default_subject': None,
+            'default_body': """⏰ Erinnerung: Dienst morgen!
+📅 {date}
+⏰ {time}
+
+{org_name}"""
+        }
+    }
+    
+    # Platzhalter-Info
+    with st.expander("ℹ️ Verfügbare Platzhalter", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("""
+            **Standard:**
+            - `{name}` - Name des Benutzers
+            - `{date}` - Datum (formatiert: DD.MM.YYYY)
+            - `{time}` - Uhrzeit
+            - `{email}` - E-Mail des Benutzers
+            """)
+        with col2:
+            st.markdown("""
+            **Erweitert:**
+            - `{phone}` - Telefonnummer
+            - `{org_name}` - Organisationsname
+            - `{org_email}` - Organisation E-Mail
+            - `{current_date}` - Heutiges Datum
+            """)
+        st.caption("💡 Platzhalter werden automatisch durch echte Daten ersetzt")
+    
+    st.divider()
+    
+    # Tabs für Template-Typen
+    tab_names = [t['name'] for t in templates.values()]
+    tabs = st.tabs(tab_names)
+    
+    for i, (template_key, template_config) in enumerate(templates.items()):
+        with tabs[i]:
+            # Lade gespeicherten Inhalt oder verwende Default
+            saved_subject = ww_db.get_setting(f'{template_key}_subject', template_config['default_subject'])
+            saved_body = ww_db.get_setting(f'{template_key}_body', template_config['default_body'])
+            
+            # Editor
+            if template_config['type'] == 'email':
+                subject = st.text_input(
+                    "Betreff",
+                    value=saved_subject if saved_subject else template_config['default_subject'],
+                    key=f"subject_{template_key}",
+                    help="Betreff der E-Mail (nur bei E-Mails)"
+                )
+            else:
+                subject = None
+            
+            body = st.text_area(
+                "Nachricht",
+                value=saved_body if saved_body else template_config['default_body'],
+                height=300,
+                key=f"body_{template_key}",
+                help="Nachrichtentext - verwenden Sie Platzhalter für dynamische Inhalte"
+            )
+            
+            # Buttons
+            col1, col2, col3 = st.columns([2, 2, 6])
+            
+            with col1:
+                if st.button("💾 Speichern", key=f"save_{template_key}", use_container_width=True, type="primary"):
+                    success = True
+                    if subject:
+                        success = success and ww_db.set_setting(f'{template_key}_subject', subject)
+                    success = success and ww_db.set_setting(f'{template_key}_body', body)
+                    
+                    if success:
+                        st.success("✅ Template gespeichert!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Fehler beim Speichern")
+            
+            with col2:
+                if st.button("🔄 Zurücksetzen", key=f"reset_{template_key}", use_container_width=True):
+                    ww_db.set_setting(f'{template_key}_subject', template_config['default_subject'])
+                    ww_db.set_setting(f'{template_key}_body', template_config['default_body'])
+                    st.success("✅ Auf Standard zurückgesetzt!")
+                    st.rerun()
+            
+            # Live-Vorschau
+            st.divider()
+            st.markdown("### 👁️ Live-Vorschau")
+            
+            # Beispieldaten für Vorschau
+            preview_data = {
+                'name': 'Max Mustermann',
+                'date': '15.12.2025',
+                'time': '14:00 - 17:00',
+                'email': 'max.mustermann@example.com',
+                'phone': '+49 172 1234567',
+                'org_name': 'Wasserwacht München',
+                'org_email': 'info@wasserwacht-muenchen.de',
+                'current_date': datetime.now().strftime('%d.%m.%Y %H:%M')
+            }
+            
+            # Template-Rendering
+            preview_body = body
+            if subject:
+                preview_subject = subject
+                for key, value in preview_data.items():
+                    preview_subject = preview_subject.replace('{' + key + '}', str(value))
+                for key, value in preview_data.items():
+                    preview_body = preview_body.replace('{' + key + '}', str(value))
+                
+                st.markdown(f"**Betreff:** {preview_subject}")
+            else:
+                for key, value in preview_data.items():
+                    preview_body = preview_body.replace('{' + key + '}', str(value))
+            
+            # Vorschau-Box
+            if template_config['type'] == 'email':
+                st.code(preview_body, language=None)
+            else:
+                st.info(preview_body)
+            
+            st.caption("💡 So wird die Nachricht mit Beispieldaten aussehen")
+
+# ===== MAIN =====
+def main():
+    # CSS injizieren
+    inject_css(dark=st.session_state.dark_mode)
+    
+    # Login Check
+    if not st.session_state.user:
+        login_page()
+        return
+    
+    # Navigation anzeigen
+    show_navigation()
+    
+    # Seiten-Router
+    page = st.session_state.page
+    user = st.session_state.user
+    is_admin = user.get('role') == 'admin'
+    
+    if page == 'kalender':
+        kalender_page()
+    
+    elif page == 'meine_buchungen':
+        meine_buchungen_page()
+    
+    elif page == 'statistik':
+        statistik_page()
+    
+    elif page == 'verwaltung':
+        if is_admin:
+            verwaltung_page()
+        else:
+            st.error("❌ Keine Berechtigung")
+    
+    elif page == 'benutzer':
+        if is_admin:
+            benutzer_page()
+        else:
+            st.error("❌ Keine Berechtigung")
+    
+    elif page == 'export':
+        if is_admin:
+            export_page()
+        else:
+            st.error("❌ Keine Berechtigung")
+    
+    elif page == 'debug':
+        if is_admin:
+            debug_page()
+        else:
+            st.error("❌ Keine Berechtigung")
+    
+    elif page == 'handbuch':
+        handbuch_page()
+        
+    elif page == 'impressum':
+        impressum_page()
+        
+    elif page == 'profil':
+        profil_page()
+        
+    elif page == 'vorlagen':
+        if is_admin:
+            vorlagen_page()
+        else:
+            st.error("❌ Keine Berechtigung")
+    
+    else:
+        st.error(f"❌ Unbekannte Seite: {page}")
+
+if __name__ == "__main__":
+    main()
